@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -25,7 +26,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._report_timing = get_bool_env_var("SGLANG_DFLASH_REPORT_TIMING")
+        self._last_draft_time_s = 0.0
 
         # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
@@ -198,6 +201,36 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+    def _measure_forward_s(self, fn) -> tuple[object, float]:
+        if not self._report_timing:
+            return fn(), 0.0
+
+        if is_cuda():
+            with torch.cuda.device(self.model_runner.device):
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                out = fn()
+                end_event.record()
+                end_event.synchronize()
+                return out, float(start_event.elapsed_time(end_event)) / 1000.0
+
+        start_t = time.perf_counter()
+        out = fn()
+        return out, time.perf_counter() - start_t
+
+    @staticmethod
+    def _accumulate_req_shared_time(
+        reqs: list, attr_name: str, total_time_s: float
+    ) -> None:
+        if total_time_s <= 0.0 or len(reqs) == 0:
+            return
+
+        # One verify/draft forward pass is shared by all active requests.
+        per_req_time_s = total_time_s / float(len(reqs))
+        for req in reqs:
+            setattr(req, attr_name, float(getattr(req, attr_name, 0.0)) + per_req_time_s)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -535,9 +568,11 @@ class DFlashWorker:
             )
 
             with torch.inference_mode():
-                draft_hidden = self.draft_model_runner.forward(
-                    forward_batch
-                ).logits_output
+                draft_out, draft_time_s = self._measure_forward_s(
+                    lambda: self.draft_model_runner.forward(forward_batch)
+                )
+                draft_hidden = draft_out.logits_output
+                self._last_draft_time_s = float(draft_time_s)
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -1038,6 +1073,10 @@ class DFlashWorker:
             )
 
         self._prepare_for_speculative_decoding(batch, draft_input)
+        if self._report_timing and self.tp_rank == 0:
+            self._accumulate_req_shared_time(
+                batch.reqs, "spec_draft_time_s", float(self._last_draft_time_s)
+            )
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
@@ -1051,9 +1090,15 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
+        batch_result, verify_time_s = self._measure_forward_s(
+            lambda: self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True, **kwargs
+            )
         )
+        if self._report_timing and self.tp_rank == 0:
+            self._accumulate_req_shared_time(
+                batch.reqs, "spec_verify_time_s", float(verify_time_s)
+            )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,

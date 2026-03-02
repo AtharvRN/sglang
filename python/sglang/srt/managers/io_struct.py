@@ -91,6 +91,10 @@ class SpeculativeDecodingMetricsMixin:
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
 
+    # Attributed speculative timing totals (seconds), if exposed by the server.
+    spec_draft_time_s: List[float]
+    spec_verify_time_s: List[float]
+
 
 # Parameters for a session
 @dataclass

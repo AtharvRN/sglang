@@ -1841,6 +1841,33 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+            # Optional timing stats exposed by speculative workers.
+            if (
+                hasattr(recv_obj, "spec_draft_time_s")
+                and recv_obj.spec_draft_time_s is not None
+                and len(recv_obj.spec_draft_time_s) > i
+            ):
+                draft_time_s = recv_obj.spec_draft_time_s[i]
+                if draft_time_s is not None:
+                    meta_info["spec_draft_time_s"] = float(draft_time_s)
+                    if recv_obj.spec_verify_ct[i] > 0:
+                        meta_info["spec_draft_time_per_cycle_s"] = float(
+                            draft_time_s / recv_obj.spec_verify_ct[i]
+                        )
+
+            if (
+                hasattr(recv_obj, "spec_verify_time_s")
+                and recv_obj.spec_verify_time_s is not None
+                and len(recv_obj.spec_verify_time_s) > i
+            ):
+                verify_time_s = recv_obj.spec_verify_time_s[i]
+                if verify_time_s is not None:
+                    meta_info["spec_verify_time_s"] = float(verify_time_s)
+                    if recv_obj.spec_verify_ct[i] > 0:
+                        meta_info["spec_verify_time_per_cycle_s"] = float(
+                            verify_time_s / recv_obj.spec_verify_ct[i]
+                        )
+
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
                 recv_obj.spec_acceptance_histogram

@@ -747,6 +747,11 @@ class Req(ReqDllmMixin):
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # Attributed speculative timing totals for this request (seconds).
+        # These are populated by speculative workers when timing is enabled.
+        self.spec_draft_time_s = 0.0
+        self.spec_verify_time_s = 0.0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
