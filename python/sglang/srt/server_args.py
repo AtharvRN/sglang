@@ -479,6 +479,7 @@ class ServerArgs:
     speculative_dflash_adaptive_delta: float = 1.0
     speculative_dflash_adaptive_k_min: Optional[int] = None
     speculative_dflash_adaptive_k_max: Optional[int] = None
+    speculative_dflash_adaptive_k_start: Optional[int] = None
     speculative_dflash_adaptive_low_accept_threshold: float = 0.35
     speculative_dflash_adaptive_low_accept_streak: int = 2
     speculative_accept_threshold_single: float = 1.0
@@ -2504,6 +2505,11 @@ class ServerArgs:
                     if self.speculative_dflash_adaptive_k_max is None
                     else int(self.speculative_dflash_adaptive_k_max)
                 )
+                k_start = (
+                    int(self.speculative_num_draft_tokens)
+                    if self.speculative_dflash_adaptive_k_start is None
+                    else int(self.speculative_dflash_adaptive_k_start)
+                )
                 if k_min < 1:
                     raise ValueError(
                         "DFLASH adaptive mode requires --speculative-dflash-adaptive-k-min >= 1."
@@ -2523,8 +2529,24 @@ class ServerArgs:
                         f"(speculative_num_draft_tokens={self.speculative_num_draft_tokens}). "
                         f"Got k_max={k_max}."
                     )
+                if k_start < 1:
+                    raise ValueError(
+                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-k-start >= 1."
+                    )
+                if k_start < k_min or k_start > k_max:
+                    raise ValueError(
+                        "DFLASH adaptive mode requires k_start within [k_min, k_max]. "
+                        f"Got k_start={k_start}, k_min={k_min}, k_max={k_max}."
+                    )
+                if k_start > int(self.speculative_num_draft_tokens):
+                    raise ValueError(
+                        "DFLASH adaptive k_start cannot exceed configured max block size "
+                        f"(speculative_num_draft_tokens={self.speculative_num_draft_tokens}). "
+                        f"Got k_start={k_start}."
+                    )
                 self.speculative_dflash_adaptive_k_min = k_min
                 self.speculative_dflash_adaptive_k_max = k_max
+                self.speculative_dflash_adaptive_k_start = k_start
 
                 if not (0.0 <= float(self.speculative_dflash_adaptive_low_accept_threshold) <= 1.0):
                     raise ValueError(
@@ -4228,6 +4250,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_dflash_adaptive_k_max,
             help="DFLASH adaptive maximum runtime block size. Defaults to --speculative-num-draft-tokens.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-k-start",
+            type=int,
+            default=ServerArgs.speculative_dflash_adaptive_k_start,
+            help=(
+                "DFLASH adaptive initial runtime block size for each request. "
+                "Defaults to --speculative-num-draft-tokens."
+            ),
         )
         parser.add_argument(
             "--speculative-dflash-adaptive-low-accept-threshold",

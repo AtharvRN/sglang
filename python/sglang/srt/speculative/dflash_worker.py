@@ -168,6 +168,11 @@ class DFlashWorker:
             if server_args.speculative_dflash_adaptive_k_max is not None
             else int(self.block_size)
         )
+        self._adaptive_k_start = (
+            int(server_args.speculative_dflash_adaptive_k_start)
+            if server_args.speculative_dflash_adaptive_k_start is not None
+            else int(self.block_size)
+        )
         self._adaptive_low_accept_threshold = float(
             server_args.speculative_dflash_adaptive_low_accept_threshold
         )
@@ -191,9 +196,10 @@ class DFlashWorker:
             )
             if self._adaptive_block_size_enabled:
                 logger.info(
-                    "DFLASH adaptive block size enabled. k_min=%d k_max=%d rho=%.3f delta=%.3f low_accept_threshold=%.3f low_accept_streak=%d",
+                    "DFLASH adaptive block size enabled. k_min=%d k_max=%d k_start=%d rho=%.3f delta=%.3f low_accept_threshold=%.3f low_accept_streak=%d",
                     self._adaptive_k_min,
                     self._adaptive_k_max,
+                    self._adaptive_k_start,
                     self._adaptive_rho,
                     self._adaptive_delta,
                     self._adaptive_low_accept_threshold,
@@ -248,7 +254,7 @@ class DFlashWorker:
         ):
             return self._clamp_runtime_block_size(req.dflash_adaptive_current_bs)
 
-        init_bs = int(self.block_size)
+        init_bs = int(self._adaptive_k_start if self._adaptive_block_size_enabled else self.block_size)
         sampling_params = getattr(req, "sampling_params", None)
         custom_params = (
             getattr(sampling_params, "custom_params", None)
