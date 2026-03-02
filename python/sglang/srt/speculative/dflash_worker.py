@@ -153,6 +153,29 @@ class DFlashWorker:
                     model_block_size,
                 )
 
+        self._adaptive_block_size_enabled = bool(
+            server_args.speculative_dflash_adaptive_block_size
+        )
+        self._adaptive_rho = float(server_args.speculative_dflash_adaptive_rho)
+        self._adaptive_delta = float(server_args.speculative_dflash_adaptive_delta)
+        self._adaptive_k_min = (
+            int(server_args.speculative_dflash_adaptive_k_min)
+            if server_args.speculative_dflash_adaptive_k_min is not None
+            else 1
+        )
+        self._adaptive_k_max = (
+            int(server_args.speculative_dflash_adaptive_k_max)
+            if server_args.speculative_dflash_adaptive_k_max is not None
+            else int(self.block_size)
+        )
+        self._adaptive_low_accept_threshold = float(
+            server_args.speculative_dflash_adaptive_low_accept_threshold
+        )
+        self._adaptive_low_accept_streak = int(
+            server_args.speculative_dflash_adaptive_low_accept_streak
+        )
+        self._last_runtime_block_size = int(self.block_size)
+
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
         self._mask_token_id = self._resolve_mask_token_id(
@@ -166,6 +189,16 @@ class DFlashWorker:
                 self.draft_model.__class__.__name__,
                 self.block_size,
             )
+            if self._adaptive_block_size_enabled:
+                logger.info(
+                    "DFLASH adaptive block size enabled. k_min=%d k_max=%d rho=%.3f delta=%.3f low_accept_threshold=%.3f low_accept_streak=%d",
+                    self._adaptive_k_min,
+                    self._adaptive_k_max,
+                    self._adaptive_rho,
+                    self._adaptive_delta,
+                    self._adaptive_low_accept_threshold,
+                    self._adaptive_low_accept_streak,
+                )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
                 self._mask_token,
@@ -205,18 +238,83 @@ class DFlashWorker:
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
+    def _clamp_runtime_block_size(self, value: int) -> int:
+        return int(min(max(1, int(value)), int(self.block_size)))
+
+    def _init_req_adaptive_state(self, req) -> int:
+        if (
+            getattr(req, "dflash_adaptive_current_bs", None) is not None
+            and int(req.dflash_adaptive_current_bs) >= 1
+        ):
+            return self._clamp_runtime_block_size(req.dflash_adaptive_current_bs)
+
+        init_bs = int(self.block_size)
+        sampling_params = getattr(req, "sampling_params", None)
+        custom_params = (
+            getattr(sampling_params, "custom_params", None)
+            if sampling_params is not None
+            else None
+        )
+        if isinstance(custom_params, dict) and "dflash_block_size" in custom_params:
+            raw_val = custom_params["dflash_block_size"]
+            try:
+                init_bs = int(raw_val)
+            except Exception:
+                if not self._warned_invalid_runtime_block_size and self.tp_rank == 0:
+                    logger.warning(
+                        "Ignoring invalid runtime dflash_block_size=%r. "
+                        "Expected an integer in [1, %d].",
+                        raw_val,
+                        int(self.block_size),
+                    )
+                    self._warned_invalid_runtime_block_size = True
+
+        init_bs = self._clamp_runtime_block_size(init_bs)
+        init_bs = int(min(max(init_bs, int(self._adaptive_k_min)), int(self._adaptive_k_max)))
+
+        req.dflash_adaptive_current_bs = init_bs
+        req.dflash_adaptive_lgen_hat = None
+        req.dflash_adaptive_lacc_hat = None
+        req.dflash_adaptive_low_accept_count = 0
+        return init_bs
+
     def _resolve_runtime_block_size(self, batch: ScheduleBatch) -> int:
-        """Resolve per-batch DFLASH block size, bounded by configured max block size.
+        """Resolve runtime DFLASH block size for the current decode step.
 
-        Runtime override is optional and read from request sampling custom params:
-          sampling_params.custom_params["dflash_block_size"].
-        If a mixed block-size batch appears, we use the minimum requested size so one
-        TARGET_VERIFY pass can still serve the whole batch.
+        Modes:
+        - Adaptive mode ON: use per-request adaptive state and choose an effective
+          batch block size as the minimum desired block size among active requests.
+        - Adaptive mode OFF: fallback to optional request custom param
+          (`sampling_params.custom_params['dflash_block_size']`) with min-on-mixed policy.
         """
-
         max_block_size = int(self.block_size)
-        runtime_block_sizes: list[int] = []
 
+        if self._adaptive_block_size_enabled:
+            desired: list[int] = []
+            for req in batch.reqs:
+                desired.append(int(self._init_req_adaptive_state(req)))
+
+            if len(desired) == 0:
+                return max_block_size
+
+            effective_block_size = int(min(desired))
+
+            if (
+                len(set(desired)) > 1
+                and not self._warned_mixed_runtime_block_size
+                and self.tp_rank == 0
+            ):
+                logger.info(
+                    "DFLASH adaptive per-request desired block sizes are mixed (%s); "
+                    "using min=%d for this step.",
+                    sorted(set(desired)),
+                    effective_block_size,
+                )
+                self._warned_mixed_runtime_block_size = True
+
+            return effective_block_size
+
+        runtime_block_sizes: list[int] = []
         for req in batch.reqs:
             sampling_params = getattr(req, "sampling_params", None)
             custom_params = (
@@ -226,10 +324,8 @@ class DFlashWorker:
             )
             if not isinstance(custom_params, dict):
                 continue
-
             if "dflash_block_size" not in custom_params:
                 continue
-
             raw_val = custom_params["dflash_block_size"]
             try:
                 runtime_block_sizes.append(int(raw_val))
@@ -246,22 +342,19 @@ class DFlashWorker:
         if len(runtime_block_sizes) == 0:
             return max_block_size
 
-        clamped = [min(max(1, int(v)), max_block_size) for v in runtime_block_sizes]
+        clamped = [self._clamp_runtime_block_size(v) for v in runtime_block_sizes]
         effective_block_size = int(min(clamped))
-
         if (
             len(set(clamped)) > 1
             and not self._warned_mixed_runtime_block_size
             and self.tp_rank == 0
         ):
             logger.info(
-                "DFLASH mixed runtime block sizes in one batch (%s); "
-                "using min=%d for this step.",
+                "DFLASH mixed runtime block sizes in one batch (%s); using min=%d for this step.",
                 sorted(set(clamped)),
                 effective_block_size,
             )
             self._warned_mixed_runtime_block_size = True
-
         if (
             effective_block_size != max_block_size
             and not self._logged_runtime_block_size_override
@@ -273,8 +366,54 @@ class DFlashWorker:
                 effective_block_size,
             )
             self._logged_runtime_block_size_override = True
-
         return effective_block_size
+
+    def _update_req_adaptive_state(
+        self, req, *, accepted_draft_tokens: int, runtime_block_size: int
+    ) -> None:
+        if not self._adaptive_block_size_enabled:
+            return
+
+        current_bs = self._init_req_adaptive_state(req)
+        proposed = max(0, int(runtime_block_size) - 1)
+        accepted = max(0, int(accepted_draft_tokens))
+
+        # EWMA signals over proposal/accept lengths (proposal excludes current token).
+        old_lgen = getattr(req, "dflash_adaptive_lgen_hat", None)
+        old_lacc = getattr(req, "dflash_adaptive_lacc_hat", None)
+        if old_lgen is None:
+            lgen_hat = float(proposed)
+        else:
+            lgen_hat = float((1.0 - self._adaptive_rho) * old_lgen + self._adaptive_rho * float(proposed))
+        if old_lacc is None:
+            lacc_hat = float(accepted)
+        else:
+            lacc_hat = float((1.0 - self._adaptive_rho) * old_lacc + self._adaptive_rho * float(accepted))
+
+        req.dflash_adaptive_lgen_hat = lgen_hat
+        req.dflash_adaptive_lacc_hat = lacc_hat
+
+        growth = float(self._adaptive_delta) if lacc_hat >= lgen_hat else 0.0
+        next_proposed = int(math.ceil(lgen_hat + growth))
+        next_bs = int(next_proposed + 1)
+
+        # Immediate conservative fallback on persistent low acceptance.
+        denom = max(1, proposed)
+        accept_ratio = float(accepted) / float(denom)
+        if accept_ratio < float(self._adaptive_low_accept_threshold):
+            req.dflash_adaptive_low_accept_count = int(
+                getattr(req, "dflash_adaptive_low_accept_count", 0)
+            ) + 1
+        else:
+            req.dflash_adaptive_low_accept_count = 0
+
+        if req.dflash_adaptive_low_accept_count >= int(self._adaptive_low_accept_streak):
+            next_bs = min(next_bs, max(int(self._adaptive_k_min), int(current_bs) - 1))
+            req.dflash_adaptive_low_accept_count = 0
+
+        next_bs = int(min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max)))
+        next_bs = self._clamp_runtime_block_size(next_bs)
+        req.dflash_adaptive_current_bs = next_bs
 
     def _measure_forward_s(self, fn) -> tuple[object, float]:
         if not self._report_timing:
@@ -426,6 +565,11 @@ class DFlashWorker:
         # there is no separate draft allocation to release here.
         if hasattr(req, "dflash_draft_seq_len"):
             req.dflash_draft_seq_len = 0
+        if hasattr(req, "dflash_adaptive_current_bs"):
+            req.dflash_adaptive_current_bs = None
+            req.dflash_adaptive_lgen_hat = None
+            req.dflash_adaptive_lacc_hat = None
+            req.dflash_adaptive_low_accept_count = 0
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -534,6 +678,7 @@ class DFlashWorker:
         bs = batch.batch_size()
         device = self.model_runner.device
         runtime_block_size = self._resolve_runtime_block_size(batch)
+        self._last_runtime_block_size = int(runtime_block_size)
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -1198,6 +1343,17 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        if self._adaptive_block_size_enabled:
+            runtime_bs = int(getattr(self, "_last_runtime_block_size", self.block_size))
+            for req, accepted_draft_tokens in zip(
+                batch.reqs, accept_length_per_req_cpu, strict=True
+            ):
+                self._update_req_adaptive_state(
+                    req,
+                    accepted_draft_tokens=int(accepted_draft_tokens),
+                    runtime_block_size=runtime_bs,
+                )
+
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(

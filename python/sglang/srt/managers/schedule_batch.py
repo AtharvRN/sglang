@@ -756,6 +756,14 @@ class Req(ReqDllmMixin):
         self.spec_draft_time_s = 0.0
         self.spec_verify_time_s = 0.0
 
+        # DFLASH adaptive block-size state (server-side, per-request).
+        # `current_bs` is the desired DFLASH block size for the next speculative cycle.
+        # It is updated after each verify step from this request's acceptance history.
+        self.dflash_adaptive_current_bs: Optional[int] = None
+        self.dflash_adaptive_lgen_hat: Optional[float] = None
+        self.dflash_adaptive_lacc_hat: Optional[float] = None
+        self.dflash_adaptive_low_accept_count: int = 0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.

@@ -474,6 +474,13 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_adaptive_block_size: bool = False
+    speculative_dflash_adaptive_rho: float = 0.3
+    speculative_dflash_adaptive_delta: float = 1.0
+    speculative_dflash_adaptive_k_min: Optional[int] = None
+    speculative_dflash_adaptive_k_max: Optional[int] = None
+    speculative_dflash_adaptive_low_accept_threshold: float = 0.35
+    speculative_dflash_adaptive_low_accept_streak: int = 2
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2475,6 +2482,61 @@ class ServerArgs:
                     )
                 self.speculative_num_draft_tokens = inferred_block_size
 
+            if self.speculative_dflash_adaptive_block_size:
+                if not (0.0 < float(self.speculative_dflash_adaptive_rho) <= 1.0):
+                    raise ValueError(
+                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-rho in (0, 1]. "
+                        f"Got {self.speculative_dflash_adaptive_rho}."
+                    )
+                if float(self.speculative_dflash_adaptive_delta) < 0.0:
+                    raise ValueError(
+                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-delta >= 0. "
+                        f"Got {self.speculative_dflash_adaptive_delta}."
+                    )
+
+                k_min = (
+                    1
+                    if self.speculative_dflash_adaptive_k_min is None
+                    else int(self.speculative_dflash_adaptive_k_min)
+                )
+                k_max = (
+                    int(self.speculative_num_draft_tokens)
+                    if self.speculative_dflash_adaptive_k_max is None
+                    else int(self.speculative_dflash_adaptive_k_max)
+                )
+                if k_min < 1:
+                    raise ValueError(
+                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-k-min >= 1."
+                    )
+                if k_max < 1:
+                    raise ValueError(
+                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-k-max >= 1."
+                    )
+                if k_min > k_max:
+                    raise ValueError(
+                        "DFLASH adaptive mode requires k_min <= k_max. "
+                        f"Got k_min={k_min}, k_max={k_max}."
+                    )
+                if k_max > int(self.speculative_num_draft_tokens):
+                    raise ValueError(
+                        "DFLASH adaptive k_max cannot exceed configured max block size "
+                        f"(speculative_num_draft_tokens={self.speculative_num_draft_tokens}). "
+                        f"Got k_max={k_max}."
+                    )
+                self.speculative_dflash_adaptive_k_min = k_min
+                self.speculative_dflash_adaptive_k_max = k_max
+
+                if not (0.0 <= float(self.speculative_dflash_adaptive_low_accept_threshold) <= 1.0):
+                    raise ValueError(
+                        "DFLASH adaptive low-accept threshold must be in [0,1]. "
+                        f"Got {self.speculative_dflash_adaptive_low_accept_threshold}."
+                    )
+                if int(self.speculative_dflash_adaptive_low_accept_streak) < 1:
+                    raise ValueError(
+                        "DFLASH adaptive low-accept streak must be >= 1. "
+                        f"Got {self.speculative_dflash_adaptive_low_accept_streak}."
+                    )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
@@ -4136,6 +4198,48 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-block-size",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_adaptive_block_size,
+            help="DFLASH only. Enable server-side adaptive block size (updated per-request from acceptance history).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-rho",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_rho,
+            help="DFLASH adaptive EWMA rho in (0,1].",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-delta",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_delta,
+            help="DFLASH adaptive growth increment for proposal length when acceptance keeps up.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-k-min",
+            type=int,
+            default=ServerArgs.speculative_dflash_adaptive_k_min,
+            help="DFLASH adaptive minimum runtime block size. Defaults to 1.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-k-max",
+            type=int,
+            default=ServerArgs.speculative_dflash_adaptive_k_max,
+            help="DFLASH adaptive maximum runtime block size. Defaults to --speculative-num-draft-tokens.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-low-accept-threshold",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_low_accept_threshold,
+            help="DFLASH adaptive immediate fallback threshold on acceptance ratio (accepted_draft / proposed_draft).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-low-accept-streak",
+            type=int,
+            default=ServerArgs.speculative_dflash_adaptive_low_accept_streak,
+            help="DFLASH adaptive consecutive low-accept cycles before forcing one-step block-size decrease.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
