@@ -77,6 +77,9 @@ class DFlashWorker:
         self._logged_first_verify = False
         self._report_timing = get_bool_env_var("SGLANG_DFLASH_REPORT_TIMING")
         self._last_draft_time_s = 0.0
+        self._warned_mixed_runtime_block_size = False
+        self._warned_invalid_runtime_block_size = False
+        self._logged_runtime_block_size_override = False
 
         # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
@@ -201,6 +204,77 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+    def _resolve_runtime_block_size(self, batch: ScheduleBatch) -> int:
+        """Resolve per-batch DFLASH block size, bounded by configured max block size.
+
+        Runtime override is optional and read from request sampling custom params:
+          sampling_params.custom_params["dflash_block_size"].
+        If a mixed block-size batch appears, we use the minimum requested size so one
+        TARGET_VERIFY pass can still serve the whole batch.
+        """
+
+        max_block_size = int(self.block_size)
+        runtime_block_sizes: list[int] = []
+
+        for req in batch.reqs:
+            sampling_params = getattr(req, "sampling_params", None)
+            custom_params = (
+                getattr(sampling_params, "custom_params", None)
+                if sampling_params is not None
+                else None
+            )
+            if not isinstance(custom_params, dict):
+                continue
+
+            if "dflash_block_size" not in custom_params:
+                continue
+
+            raw_val = custom_params["dflash_block_size"]
+            try:
+                runtime_block_sizes.append(int(raw_val))
+            except Exception:
+                if not self._warned_invalid_runtime_block_size and self.tp_rank == 0:
+                    logger.warning(
+                        "Ignoring invalid runtime dflash_block_size=%r. "
+                        "Expected an integer in [1, %d].",
+                        raw_val,
+                        max_block_size,
+                    )
+                    self._warned_invalid_runtime_block_size = True
+
+        if len(runtime_block_sizes) == 0:
+            return max_block_size
+
+        clamped = [min(max(1, int(v)), max_block_size) for v in runtime_block_sizes]
+        effective_block_size = int(min(clamped))
+
+        if (
+            len(set(clamped)) > 1
+            and not self._warned_mixed_runtime_block_size
+            and self.tp_rank == 0
+        ):
+            logger.info(
+                "DFLASH mixed runtime block sizes in one batch (%s); "
+                "using min=%d for this step.",
+                sorted(set(clamped)),
+                effective_block_size,
+            )
+            self._warned_mixed_runtime_block_size = True
+
+        if (
+            effective_block_size != max_block_size
+            and not self._logged_runtime_block_size_override
+            and self.tp_rank == 0
+        ):
+            logger.info(
+                "DFLASH runtime block-size override active: max=%d, effective=%d.",
+                max_block_size,
+                effective_block_size,
+            )
+            self._logged_runtime_block_size_override = True
+
+        return effective_block_size
 
     def _measure_forward_s(self, fn) -> tuple[object, float]:
         if not self._report_timing:
@@ -459,6 +533,7 @@ class DFlashWorker:
 
         bs = batch.batch_size()
         device = self.model_runner.device
+        runtime_block_size = self._resolve_runtime_block_size(batch)
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -484,7 +559,7 @@ class DFlashWorker:
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
-        block_ids = self._draft_block_ids_buf[:bs]
+        block_ids = self._draft_block_ids_buf[:bs, :runtime_block_size]
         block_ids.fill_(int(self._mask_token_id))
         block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
 
@@ -495,13 +570,17 @@ class DFlashWorker:
         # prefix before drafting the next block.
         prefix_lens = batch.seq_lens  # int32, device
 
-        positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
+        positions_2d = self._draft_block_positions_buf[:bs, :runtime_block_size]
+        torch.add(
+            prefix_lens.unsqueeze(1),
+            self._block_pos_offsets[:runtime_block_size],
+            out=positions_2d,
+        )
         positions = positions_2d.reshape(-1)
 
         block_start = prefix_lens
         block_end = self._draft_block_end_buf[:bs]
-        torch.add(block_start, int(self.block_size), out=block_end)
+        torch.add(block_start, runtime_block_size, out=block_end)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if batch.seq_lens_cpu.dtype == torch.int32:
@@ -512,9 +591,9 @@ class DFlashWorker:
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
             if self.page_size == 1:
-                block_cache_loc = allocator.alloc(bs * self.block_size)
+                block_cache_loc = allocator.alloc(bs * runtime_block_size)
             else:
-                block_end_cpu = seq_lens_cpu + int(self.block_size)
+                block_end_cpu = seq_lens_cpu + runtime_block_size
                 last_loc = get_last_loc(
                     self.draft_model_runner.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
@@ -526,11 +605,12 @@ class DFlashWorker:
                     block_end,
                     block_end_cpu,
                     last_loc,
-                    bs * self.block_size,
+                    bs * runtime_block_size,
                 )
             if block_cache_loc is None:
                 raise RuntimeError(
-                    f"DFLASH draft OOM when allocating {bs * self.block_size} block tokens."
+                    "DFLASH draft OOM when allocating "
+                    f"{bs * runtime_block_size} block tokens."
                 )
 
             assign_req_to_token_pool_func(
@@ -542,10 +622,13 @@ class DFlashWorker:
                 bs,
             )
 
-            # Use TARGET_VERIFY mode (cuda-graphable) to run a fixed-size draft block.
-            # In this mode, `seq_lens` stores the prefix lengths; attention backends
-            # derive kv_len by adding `draft_token_num`.
+            # Use TARGET_VERIFY mode for draft forwarding. In this mode, `seq_lens`
+            # stores prefix lengths; attention backends derive kv_len by adding
+            # `draft_token_num` (runtime block size for this step).
             draft_spec_info = self._draft_block_spec_info
+            draft_spec_info.draft_token_num = int(runtime_block_size)
+            draft_spec_info.num_tokens_per_batch = int(runtime_block_size)
+            draft_spec_info.custom_mask = None
             seq_lens = prefix_lens
             seq_lens_sum = int(batch.seq_lens_sum)
             forward_batch = ForwardBatch(
@@ -577,20 +660,21 @@ class DFlashWorker:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
 
-        draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+        draft_hidden = draft_hidden.view(bs, runtime_block_size, -1)
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
+        ).view(bs, runtime_block_size - 1)
+        draft_tokens = self._draft_block_tokens_buf[:bs, :runtime_block_size]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        if runtime_block_size > 1:
+            draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens.reshape(-1),
             positions=positions,
-            draft_token_num=self.block_size,
+            draft_token_num=runtime_block_size,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend

@@ -480,8 +480,9 @@ class CudaGraphRunner:
         ):
             if self.model_runner.is_draft_worker:
                 # EAGLE/standalone/ngram draft workers use separate cuda-graph runners; do not
-                # capture TARGET_VERIFY graphs here. DFLASH draft uses a fixed-size block and
-                # reuses TARGET_VERIFY graphs for performance.
+                # capture TARGET_VERIFY graphs here. DFLASH draft uses TARGET_VERIFY
+                # graphs for the configured max block size; smaller runtime blocks can
+                # safely fall back to eager execution.
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
@@ -654,12 +655,26 @@ class CudaGraphRunner:
             else True
         )
 
+        # DFLASH normally captures TARGET_VERIFY with a fixed block size. If runtime
+        # block size is reduced (input token count differs), skip cuda-graph replay and
+        # fall back to eager for correctness.
+        is_dflash_supported = (
+            (
+                not forward_batch.forward_mode.is_target_verify()
+                or forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.model_runner.spec_algorithm.is_dflash()
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dflash_supported
         )
 
     def _init_profile_context_and_memory_record(self):
