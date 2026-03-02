@@ -128,6 +128,9 @@ def _handle_output_by_index(output, i):
             spec_accepted_tokens=_extract_field_by_index(
                 output, "spec_accepted_tokens", i
             ),
+            spec_draft_token_num=_extract_field_by_index(
+                output, "spec_draft_token_num", i
+            ),
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
             ),
@@ -216,6 +219,9 @@ def _handle_output_by_index(output, i):
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
             spec_accepted_tokens=_extract_field_by_index(
                 output, "spec_accepted_tokens", i
+            ),
+            spec_draft_token_num=_extract_field_by_index(
+                output, "spec_draft_token_num", i
             ),
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i

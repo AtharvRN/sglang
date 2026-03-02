@@ -85,6 +85,11 @@ class SpeculativeDecodingMetricsMixin:
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
 
+    # Drafted proposal token count accumulated across speculative cycles.
+    # For DFLASH with runtime block sizes this can differ from
+    #   spec_verify_ct * (configured_block_size - 1).
+    spec_draft_token_num: List[int]
+
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.

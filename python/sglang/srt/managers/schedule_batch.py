@@ -747,6 +747,10 @@ class Req(ReqDllmMixin):
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # Total drafted proposal tokens consumed by speculative verification for this request.
+        # For DFLASH this tracks sum over cycles of (runtime_block_size - 1).
+        self.spec_draft_token_num = 0
+
         # Attributed speculative timing totals for this request (seconds).
         # These are populated by speculative workers when timing is enabled.
         self.spec_draft_time_s = 0.0

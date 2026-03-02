@@ -908,6 +908,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
+        spec_draft_token_num = []
         spec_acceptance_histogram = []
         spec_draft_time_s = []
         spec_verify_time_s = []
@@ -1028,6 +1029,7 @@ class SchedulerOutputProcessorMixin:
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    spec_draft_token_num.append(req.spec_draft_token_num)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
                     spec_draft_time_s.append(float(req.spec_draft_time_s))
                     spec_verify_time_s.append(float(req.spec_verify_time_s))
@@ -1134,6 +1136,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
+                    spec_draft_token_num=spec_draft_token_num,
                     spec_acceptance_histogram=spec_acceptance_histogram,
                     spec_draft_time_s=spec_draft_time_s,
                     spec_verify_time_s=spec_verify_time_s,
