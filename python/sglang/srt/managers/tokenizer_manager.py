@@ -1888,6 +1888,39 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     i
                 ]
 
+            # Runtime DFLASH block-size histogram (if available).
+            if (
+                hasattr(recv_obj, "spec_runtime_bs_hist")
+                and recv_obj.spec_runtime_bs_hist is not None
+                and len(recv_obj.spec_runtime_bs_hist) > i
+                and recv_obj.spec_runtime_bs_hist[i]
+            ):
+                raw_hist = recv_obj.spec_runtime_bs_hist[i]
+                if isinstance(raw_hist, dict):
+                    hist = {}
+                    for k, v in raw_hist.items():
+                        try:
+                            bs = int(k)
+                            ct = int(v)
+                        except Exception:
+                            continue
+                        if bs <= 0 or ct <= 0:
+                            continue
+                        hist[bs] = ct
+                    if hist:
+                        meta_info["spec_runtime_bs_hist"] = hist
+                        total_cycles = sum(hist.values())
+                        if total_cycles > 0:
+                            mode_bs = max(
+                                sorted(hist.items()),
+                                key=lambda kv: kv[1],
+                            )[0]
+                            avg_bs = sum(bs * ct for bs, ct in hist.items()) / float(
+                                total_cycles
+                            )
+                            meta_info["spec_runtime_bs_mode"] = int(mode_bs)
+                            meta_info["spec_runtime_bs_avg"] = float(avg_bs)
+
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
             obj.sampling_params.get("json_schema", None)

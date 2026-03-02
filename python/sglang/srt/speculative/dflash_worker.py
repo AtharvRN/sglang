@@ -415,6 +415,18 @@ class DFlashWorker:
         next_bs = self._clamp_runtime_block_size(next_bs)
         req.dflash_adaptive_current_bs = next_bs
 
+    def _record_runtime_block_size_usage(
+        self, batch: ScheduleBatch, runtime_block_size: int
+    ) -> None:
+        """Accumulate per-request runtime block-size usage (one count per verify cycle)."""
+        bs = int(runtime_block_size)
+        for req in batch.reqs:
+            hist = getattr(req, "dflash_runtime_bs_hist", None)
+            if not isinstance(hist, dict):
+                hist = {}
+                req.dflash_runtime_bs_hist = hist
+            hist[bs] = int(hist.get(bs, 0)) + 1
+
     def _measure_forward_s(self, fn) -> tuple[object, float]:
         if not self._report_timing:
             return fn(), 0.0
@@ -570,6 +582,7 @@ class DFlashWorker:
             req.dflash_adaptive_lgen_hat = None
             req.dflash_adaptive_lacc_hat = None
             req.dflash_adaptive_low_accept_count = 0
+            req.dflash_runtime_bs_hist = {}
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -679,6 +692,7 @@ class DFlashWorker:
         device = self.model_runner.device
         runtime_block_size = self._resolve_runtime_block_size(batch)
         self._last_runtime_block_size = int(runtime_block_size)
+        self._record_runtime_block_size_usage(batch, runtime_block_size)
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)

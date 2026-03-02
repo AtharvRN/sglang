@@ -100,6 +100,10 @@ class SpeculativeDecodingMetricsMixin:
     spec_draft_time_s: List[float]
     spec_verify_time_s: List[float]
 
+    # Runtime DFLASH block-size histogram per request:
+    # spec_runtime_bs_hist[i] = {block_size: verify_cycle_count}.
+    spec_runtime_bs_hist: List[Dict[int, int]]
+
 
 # Parameters for a session
 @dataclass

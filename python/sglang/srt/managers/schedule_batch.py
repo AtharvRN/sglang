@@ -763,6 +763,9 @@ class Req(ReqDllmMixin):
         self.dflash_adaptive_lgen_hat: Optional[float] = None
         self.dflash_adaptive_lacc_hat: Optional[float] = None
         self.dflash_adaptive_low_accept_count: int = 0
+        # DFLASH runtime block-size usage histogram for this request:
+        # {runtime_block_size: verify_cycle_count}.
+        self.dflash_runtime_bs_hist: Dict[int, int] = {}
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
