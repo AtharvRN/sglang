@@ -443,95 +443,69 @@ class DFlashWorker:
         current_bs = self._init_req_adaptive_state(req)
         proposed = max(0, int(runtime_block_size) - 1)
         accepted = max(0, int(accepted_draft_tokens))
-        next_bs = int(current_bs)
-        step_size = max(1, int(math.ceil(max(float(self._adaptive_delta), 1e-8))))
+        action = "hold"
+        reason = "ewma_hold"
 
-        if proposed == 0:
-            # k=1 has no drafted tokens; always probe upward to avoid deadlock at k=1.
-            accept_ratio = 1.0
-        else:
-            accept_ratio = max(0.0, min(1.0, float(accepted) / float(proposed)))
-
-        prev_ratio_ewma = getattr(req, "dflash_adaptive_accept_ratio_ewma", None)
-        if prev_ratio_ewma is None:
-            accept_ratio_ewma = float(accept_ratio)
-        else:
-            rho = max(0.0, min(1.0, float(self._adaptive_rho)))
-            accept_ratio_ewma = (1.0 - rho) * float(prev_ratio_ewma) + rho * float(
-                accept_ratio
-            )
-        req.dflash_adaptive_accept_ratio_ewma = float(accept_ratio_ewma)
-        req.dflash_adaptive_last_accept_ratio = float(accept_ratio)
-
-        prev_lgen_hat = getattr(req, "dflash_adaptive_lgen_hat", None)
-        prev_lacc_hat = getattr(req, "dflash_adaptive_lacc_hat", None)
-        if prev_lgen_hat is None:
+        # Original EWMA proposal controller:
+        # - lgen_hat tracks proposed draft length (k-1)
+        # - lacc_hat tracks accepted draft length
+        # - if acceptance keeps up (lacc_hat >= lgen_hat), allow +delta growth
+        old_lgen = getattr(req, "dflash_adaptive_lgen_hat", None)
+        old_lacc = getattr(req, "dflash_adaptive_lacc_hat", None)
+        if old_lgen is None:
             lgen_hat = float(proposed)
         else:
-            lgen_hat = (1.0 - self._adaptive_rho) * float(prev_lgen_hat) + self._adaptive_rho * float(
-                proposed
+            lgen_hat = float(
+                (1.0 - self._adaptive_rho) * float(old_lgen)
+                + self._adaptive_rho * float(proposed)
             )
-        if prev_lacc_hat is None:
+        if old_lacc is None:
             lacc_hat = float(accepted)
         else:
-            lacc_hat = (1.0 - self._adaptive_rho) * float(prev_lacc_hat) + self._adaptive_rho * float(
-                accepted
+            lacc_hat = float(
+                (1.0 - self._adaptive_rho) * float(old_lacc)
+                + self._adaptive_rho * float(accepted)
             )
         req.dflash_adaptive_lgen_hat = float(lgen_hat)
         req.dflash_adaptive_lacc_hat = float(lacc_hat)
 
+        growth = float(self._adaptive_delta) if lacc_hat >= lgen_hat else 0.0
+        next_proposed = int(math.ceil(lgen_hat + growth))
+        next_bs = int(next_proposed + 1)
+        if next_bs > current_bs:
+            action = "up"
+            reason = "ewma_growth"
+        elif next_bs < current_bs:
+            action = "down"
+            reason = "ewma_shrink"
+
+        # Conservative fallback on persistent low acceptance.
         low_count = int(getattr(req, "dflash_adaptive_low_accept_count", 0) or 0)
-        high_count = int(getattr(req, "dflash_adaptive_high_accept_count", 0) or 0)
-        cooldown_remaining = int(
-            getattr(req, "dflash_adaptive_cooldown_remaining", 0) or 0
-        )
-
-        if accept_ratio_ewma <= float(self._adaptive_low_accept_threshold):
-            low_count += 1
-            high_count = 0
-        elif accept_ratio_ewma >= float(self._adaptive_high_accept_threshold):
-            high_count += 1
-            low_count = 0
-        else:
-            low_count = 0
-            high_count = 0
-
-        action = "hold"
-        reason = "streak_not_met"
         if proposed == 0:
-            next_bs = int(current_bs) + step_size
+            # k=1 has no drafted tokens; probe upward to avoid k=1 deadlock.
+            accept_ratio = 1.0
+            next_bs = max(int(next_bs), int(current_bs) + 1)
+            low_count = 0
             action = "up"
             reason = "k1_probe_recover"
-            low_count = 0
-            high_count = 0
-        elif cooldown_remaining > 0:
-            cooldown_remaining -= 1
-            reason = "cooldown"
         else:
-            # Smooth target from accepted-token EWMA with a small safety margin.
-            target_bs = int(round(float(lacc_hat) + 1.0 + float(self._adaptive_delta)))
-            target_bs = int(
-                min(max(target_bs, int(self._adaptive_k_min)), int(self._adaptive_k_max))
-            )
-            if low_count >= int(self._adaptive_low_accept_streak):
-                next_bs = min(int(current_bs) - step_size, target_bs)
-                action = "down"
-                reason = "low_accept_streak"
-                low_count = 0
-                cooldown_remaining = int(self._adaptive_cooldown_cycles)
-            elif high_count >= int(self._adaptive_high_accept_streak):
-                next_bs = max(int(current_bs) + step_size, target_bs)
-                action = "up"
-                reason = "high_accept_streak"
-                high_count = 0
-                cooldown_remaining = int(self._adaptive_cooldown_cycles)
+            accept_ratio = max(0.0, min(1.0, float(accepted) / float(proposed)))
+            if accept_ratio < float(self._adaptive_low_accept_threshold):
+                low_count += 1
             else:
-                reason = "hysteresis_band"
-                next_bs = int(current_bs)
+                low_count = 0
+
+            if low_count >= int(self._adaptive_low_accept_streak):
+                fallback_bs = max(int(self._adaptive_k_min), int(current_bs) - 1)
+                next_bs = min(int(next_bs), int(fallback_bs))
+                low_count = 0
+                if next_bs < current_bs:
+                    action = "down"
+                    reason = "low_accept_streak"
 
         req.dflash_adaptive_low_accept_count = int(low_count)
-        req.dflash_adaptive_high_accept_count = int(high_count)
-        req.dflash_adaptive_cooldown_remaining = int(cooldown_remaining)
+        req.dflash_adaptive_high_accept_count = 0
+        req.dflash_adaptive_cooldown_remaining = 0
 
         unclamped_next_bs = int(next_bs)
         next_bs = int(
@@ -550,6 +524,10 @@ class DFlashWorker:
             reason = "clamped_or_bucketed"
 
         req.dflash_adaptive_current_bs = next_bs
+        accept_ratio_ewma = (
+            float(lacc_hat) / float(max(lgen_hat, 1e-6)) if lgen_hat > 0.0 else 1.0
+        )
+        req.dflash_adaptive_accept_ratio_ewma = float(accept_ratio_ewma)
         req.dflash_adaptive_last_decision = {
             "prev_bs": int(current_bs),
             "next_bs": int(next_bs),
@@ -560,8 +538,8 @@ class DFlashWorker:
             "accepted_draft_tokens": int(accepted),
             "proposed_draft_tokens": int(proposed),
             "low_accept_count": int(low_count),
-            "high_accept_count": int(high_count),
-            "cooldown_remaining": int(cooldown_remaining),
+            "high_accept_count": 0,
+            "cooldown_remaining": 0,
             "lgen_hat": float(lgen_hat),
             "lacc_hat": float(lacc_hat),
         }
