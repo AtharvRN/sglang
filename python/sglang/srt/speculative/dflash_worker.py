@@ -31,7 +31,6 @@ from sglang.srt.utils import get_bool_env_var, is_cuda
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
-_DFLASH_ADAPTIVE_BLOCK_BUCKETS = (8, 12, 16)
 
 
 def _get_fused_kv_materialize_helper():
@@ -257,15 +256,11 @@ class DFlashWorker:
             self._init_fused_kv_helper()
 
     def _build_adaptive_block_buckets(self) -> list[int]:
-        buckets = sorted(
-            {
-                int(v)
-                for v in _DFLASH_ADAPTIVE_BLOCK_BUCKETS
-                if int(v) >= int(self._adaptive_k_min)
-                and int(v) <= int(self._adaptive_k_max)
-                and int(v) <= int(self.block_size)
-            }
-        )
+        upper = int(min(int(self._adaptive_k_max), int(self.block_size)))
+        lower = int(max(1, int(self._adaptive_k_min)))
+        if upper < lower:
+            upper = lower
+        buckets = list(range(lower, upper + 1))
         if len(buckets) == 0:
             buckets = [int(min(max(int(self._adaptive_k_start), 1), int(self.block_size)))]
         return buckets
