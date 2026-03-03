@@ -425,41 +425,19 @@ class DFlashWorker:
             return
 
         current_bs = self._init_req_adaptive_state(req)
-        proposed = max(0, int(runtime_block_size) - 1)
+        proposed = max(1, int(runtime_block_size) - 1)
         accepted = max(0, int(accepted_draft_tokens))
+        accept_ratio = float(accepted) / float(proposed)
+        req.dflash_adaptive_last_accept_ratio = float(accept_ratio)
 
-        # EWMA signals over proposal/accept lengths (proposal excludes current token).
-        old_lgen = getattr(req, "dflash_adaptive_lgen_hat", None)
-        old_lacc = getattr(req, "dflash_adaptive_lacc_hat", None)
-        if old_lgen is None:
-            lgen_hat = float(proposed)
-        else:
-            lgen_hat = float((1.0 - self._adaptive_rho) * old_lgen + self._adaptive_rho * float(proposed))
-        if old_lacc is None:
-            lacc_hat = float(accepted)
-        else:
-            lacc_hat = float((1.0 - self._adaptive_rho) * old_lacc + self._adaptive_rho * float(accepted))
-
-        req.dflash_adaptive_lgen_hat = lgen_hat
-        req.dflash_adaptive_lacc_hat = lacc_hat
-
-        growth = float(self._adaptive_delta) if lacc_hat >= lgen_hat else 0.0
-        next_proposed = int(math.ceil(lgen_hat + growth))
-        next_bs = int(next_proposed + 1)
-
-        # Immediate conservative fallback on persistent low acceptance.
-        denom = max(1, proposed)
-        accept_ratio = float(accepted) / float(denom)
+        next_bs = int(current_bs)
+        # Simple per-cycle policy:
+        # 1) If acceptance is below threshold, reduce one block size.
+        # 2) If acceptance is perfect, increase one block size.
         if accept_ratio < float(self._adaptive_low_accept_threshold):
-            req.dflash_adaptive_low_accept_count = int(
-                getattr(req, "dflash_adaptive_low_accept_count", 0)
-            ) + 1
-        else:
-            req.dflash_adaptive_low_accept_count = 0
-
-        if req.dflash_adaptive_low_accept_count >= int(self._adaptive_low_accept_streak):
-            next_bs = min(next_bs, max(int(self._adaptive_k_min), int(current_bs) - 1))
-            req.dflash_adaptive_low_accept_count = 0
+            next_bs = int(current_bs) - 1
+        elif accepted >= proposed:
+            next_bs = int(current_bs) + 1
 
         next_bs = int(min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max)))
         next_bs = self._clamp_runtime_block_size(next_bs)
