@@ -76,6 +76,7 @@ class DFlashWorker:
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
         self._report_timing = get_bool_env_var("SGLANG_DFLASH_REPORT_TIMING")
+        self._report_cycle_trace = bool(server_args.speculative_dflash_cycle_trace)
         self._last_draft_time_s = 0.0
         self._warned_mixed_runtime_block_size = False
         self._warned_invalid_runtime_block_size = False
@@ -205,6 +206,8 @@ class DFlashWorker:
                     self._adaptive_low_accept_threshold,
                     self._adaptive_low_accept_streak,
                 )
+            if self._report_cycle_trace:
+                logger.info("DFLASH per-cycle trace enabled.")
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
                 self._mask_token,
@@ -463,6 +466,58 @@ class DFlashWorker:
         for req in reqs:
             setattr(req, attr_name, float(getattr(req, attr_name, 0.0)) + per_req_time_s)
 
+    def _record_cycle_trace(
+        self,
+        *,
+        batch: ScheduleBatch,
+        accept_length_per_req_cpu: list[int],
+        runtime_block_size: int,
+        verify_time_s: float,
+    ) -> None:
+        if not self._report_cycle_trace:
+            return
+        if len(batch.reqs) == 0:
+            return
+
+        proposed_draft_tokens = max(0, int(runtime_block_size) - 1)
+        per_req_draft_time_s = (
+            float(self._last_draft_time_s) / float(len(batch.reqs))
+            if self._report_timing and self._last_draft_time_s > 0.0
+            else None
+        )
+        per_req_verify_time_s = (
+            float(verify_time_s) / float(len(batch.reqs))
+            if self._report_timing and verify_time_s > 0.0
+            else None
+        )
+
+        for req, accepted_draft_tokens in zip(
+            batch.reqs, accept_length_per_req_cpu, strict=True
+        ):
+            trace = getattr(req, "spec_cycle_trace", None)
+            if not isinstance(trace, list):
+                trace = []
+                req.spec_cycle_trace = trace
+
+            accepted_draft_tokens = int(max(0, accepted_draft_tokens))
+            accept_rate = (
+                float(accepted_draft_tokens) / float(proposed_draft_tokens)
+                if proposed_draft_tokens > 0
+                else None
+            )
+            trace.append(
+                {
+                    "cycle_idx": int(getattr(req, "spec_verify_ct", 0)),
+                    "runtime_block_size": int(runtime_block_size),
+                    "accepted_draft_tokens": accepted_draft_tokens,
+                    # Include the target bonus token for cycle-level tau.
+                    "accept_length": int(accepted_draft_tokens + 1),
+                    "accept_rate": accept_rate,
+                    "draft_time_s": per_req_draft_time_s,
+                    "verify_time_s": per_req_verify_time_s,
+                }
+            )
+
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
         try:
@@ -589,6 +644,8 @@ class DFlashWorker:
             req.dflash_adaptive_lacc_hat = None
             req.dflash_adaptive_low_accept_count = 0
             req.dflash_runtime_bs_hist = {}
+        if hasattr(req, "spec_cycle_trace"):
+            req.spec_cycle_trace = None
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -1363,8 +1420,8 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        runtime_bs = int(getattr(self, "_last_runtime_block_size", self.block_size))
         if self._adaptive_block_size_enabled:
-            runtime_bs = int(getattr(self, "_last_runtime_block_size", self.block_size))
             for req, accepted_draft_tokens in zip(
                 batch.reqs, accept_length_per_req_cpu, strict=True
             ):
@@ -1373,6 +1430,12 @@ class DFlashWorker:
                     accepted_draft_tokens=int(accepted_draft_tokens),
                     runtime_block_size=runtime_bs,
                 )
+        self._record_cycle_trace(
+            batch=batch,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            runtime_block_size=runtime_bs,
+            verify_time_s=float(verify_time_s),
+        )
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

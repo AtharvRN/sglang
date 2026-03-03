@@ -482,6 +482,7 @@ class ServerArgs:
     speculative_dflash_adaptive_k_start: Optional[int] = None
     speculative_dflash_adaptive_low_accept_threshold: float = 0.35
     speculative_dflash_adaptive_low_accept_streak: int = 2
+    speculative_dflash_cycle_trace: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2391,6 +2392,15 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if (
+            self.speculative_dflash_cycle_trace
+            and self.speculative_algorithm != "DFLASH"
+        ):
+            raise ValueError(
+                "--speculative-dflash-cycle-trace is only valid when "
+                "--speculative-algorithm DFLASH is enabled."
+            )
+
         if self.speculative_algorithm == "DFLASH":
             if self.enable_dp_attention:
                 raise ValueError(
@@ -4271,6 +4281,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_dflash_adaptive_low_accept_streak,
             help="DFLASH adaptive consecutive low-accept cycles before forcing one-step block-size decrease.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-cycle-trace",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_cycle_trace,
+            help=(
+                "DFLASH only. Emit per-request per-cycle trace in response meta_info "
+                "(accept length, runtime block size, and attributed draft/verify timings)."
+            ),
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

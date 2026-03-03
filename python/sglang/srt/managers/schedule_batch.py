@@ -755,6 +755,9 @@ class Req(ReqDllmMixin):
         # These are populated by speculative workers when timing is enabled.
         self.spec_draft_time_s = 0.0
         self.spec_verify_time_s = 0.0
+        # Optional per-cycle speculative trace for this request.
+        # Populated when server-side cycle tracing is enabled.
+        self.spec_cycle_trace: Optional[List[Dict[str, Any]]] = None
 
         # DFLASH adaptive block-size state (server-side, per-request).
         # `current_bs` is the desired DFLASH block size for the next speculative cycle.

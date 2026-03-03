@@ -383,6 +383,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             spec_draft_time_s=recv_obj.spec_draft_time_s,
             spec_verify_time_s=recv_obj.spec_verify_time_s,
             spec_runtime_bs_hist=recv_obj.spec_runtime_bs_hist,
+            spec_cycle_trace=recv_obj.spec_cycle_trace,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,

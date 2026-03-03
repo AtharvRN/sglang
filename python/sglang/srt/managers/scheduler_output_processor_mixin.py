@@ -913,6 +913,7 @@ class SchedulerOutputProcessorMixin:
         spec_draft_time_s = []
         spec_verify_time_s = []
         spec_runtime_bs_hist = []
+        spec_cycle_trace = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
@@ -1037,6 +1038,11 @@ class SchedulerOutputProcessorMixin:
                     spec_runtime_bs_hist.append(
                         dict(getattr(req, "dflash_runtime_bs_hist", {}) or {})
                     )
+                    req_cycle_trace = getattr(req, "spec_cycle_trace", None)
+                    if isinstance(req_cycle_trace, list):
+                        spec_cycle_trace.append(list(req_cycle_trace))
+                    else:
+                        spec_cycle_trace.append(None)
 
                 if return_logprob:
                     if (
@@ -1145,6 +1151,7 @@ class SchedulerOutputProcessorMixin:
                     spec_draft_time_s=spec_draft_time_s,
                     spec_verify_time_s=spec_verify_time_s,
                     spec_runtime_bs_hist=spec_runtime_bs_hist,
+                    spec_cycle_trace=spec_cycle_trace,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,

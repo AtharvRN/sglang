@@ -1921,6 +1921,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             meta_info["spec_runtime_bs_mode"] = int(mode_bs)
                             meta_info["spec_runtime_bs_avg"] = float(avg_bs)
 
+            # Optional per-cycle speculative trace (DFLASH).
+            if (
+                hasattr(recv_obj, "spec_cycle_trace")
+                and recv_obj.spec_cycle_trace is not None
+                and len(recv_obj.spec_cycle_trace) > i
+            ):
+                cycle_trace = recv_obj.spec_cycle_trace[i]
+                if isinstance(cycle_trace, list) and cycle_trace:
+                    meta_info["spec_cycle_trace"] = cycle_trace
+
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
             obj.sampling_params.get("json_schema", None)
