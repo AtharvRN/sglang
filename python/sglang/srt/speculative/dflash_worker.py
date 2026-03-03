@@ -466,6 +466,20 @@ class DFlashWorker:
         for req in reqs:
             setattr(req, attr_name, float(getattr(req, attr_name, 0.0)) + per_req_time_s)
 
+    def _iter_req_value_pairs(self, reqs: list, values, *, tag: str):
+        n_req = len(reqs)
+        n_val = len(values)
+        if n_req != n_val and self.tp_rank == 0:
+            logger.warning(
+                "DFLASH %s length mismatch (reqs=%d, values=%d); truncating to min length.",
+                tag,
+                n_req,
+                n_val,
+            )
+        n = min(n_req, n_val)
+        for i in range(n):
+            yield reqs[i], values[i]
+
     def _record_cycle_trace(
         self,
         *,
@@ -491,8 +505,8 @@ class DFlashWorker:
             else None
         )
 
-        for req, accepted_draft_tokens in zip(
-            batch.reqs, accept_length_per_req_cpu, strict=True
+        for req, accepted_draft_tokens in self._iter_req_value_pairs(
+            batch.reqs, accept_length_per_req_cpu, tag="cycle_trace"
         ):
             trace = getattr(req, "spec_cycle_trace", None)
             if not isinstance(trace, list):
@@ -1360,7 +1374,9 @@ class DFlashWorker:
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
-            for req, draft_len in zip(batch.reqs, batch.seq_lens_cpu, strict=True):
+            for req, draft_len in self._iter_req_value_pairs(
+                batch.reqs, batch.seq_lens_cpu, tag="prefill_seq_lens"
+            ):
                 req.dflash_draft_seq_len = int(draft_len)
 
             return GenerationBatchResult(
@@ -1422,8 +1438,8 @@ class DFlashWorker:
         )
         runtime_bs = int(getattr(self, "_last_runtime_block_size", self.block_size))
         if self._adaptive_block_size_enabled:
-            for req, accepted_draft_tokens in zip(
-                batch.reqs, accept_length_per_req_cpu, strict=True
+            for req, accepted_draft_tokens in self._iter_req_value_pairs(
+                batch.reqs, accept_length_per_req_cpu, tag="adaptive_update"
             ):
                 self._update_req_adaptive_state(
                     req,
