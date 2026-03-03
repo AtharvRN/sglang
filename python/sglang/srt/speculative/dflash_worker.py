@@ -180,6 +180,15 @@ class DFlashWorker:
         self._adaptive_low_accept_streak = int(
             server_args.speculative_dflash_adaptive_low_accept_streak
         )
+        self._adaptive_high_accept_threshold = float(
+            server_args.speculative_dflash_adaptive_high_accept_threshold
+        )
+        self._adaptive_high_accept_streak = int(
+            server_args.speculative_dflash_adaptive_high_accept_streak
+        )
+        self._adaptive_cooldown_cycles = int(
+            server_args.speculative_dflash_adaptive_cooldown_cycles
+        )
         self._adaptive_block_buckets: list[int] = []
         if self._adaptive_block_size_enabled:
             self._adaptive_block_buckets = self._build_adaptive_block_buckets()
@@ -200,7 +209,7 @@ class DFlashWorker:
             )
             if self._adaptive_block_size_enabled:
                 logger.info(
-                    "DFLASH adaptive block size enabled. k_min=%d k_max=%d k_start=%d rho=%.3f delta=%.3f low_accept_threshold=%.3f low_accept_streak=%d",
+                    "DFLASH adaptive block size enabled. k_min=%d k_max=%d k_start=%d rho=%.3f delta=%.3f low_accept_threshold=%.3f low_accept_streak=%d high_accept_threshold=%.3f high_accept_streak=%d cooldown_cycles=%d",
                     self._adaptive_k_min,
                     self._adaptive_k_max,
                     self._adaptive_k_start,
@@ -208,6 +217,9 @@ class DFlashWorker:
                     self._adaptive_delta,
                     self._adaptive_low_accept_threshold,
                     self._adaptive_low_accept_streak,
+                    self._adaptive_high_accept_threshold,
+                    self._adaptive_high_accept_streak,
+                    self._adaptive_cooldown_cycles,
                 )
                 if self._adaptive_block_buckets:
                     logger.info(
@@ -325,7 +337,11 @@ class DFlashWorker:
         req.dflash_adaptive_current_bs = init_bs
         req.dflash_adaptive_lgen_hat = None
         req.dflash_adaptive_lacc_hat = None
+        req.dflash_adaptive_accept_ratio_ewma = None
         req.dflash_adaptive_low_accept_count = 0
+        req.dflash_adaptive_high_accept_count = 0
+        req.dflash_adaptive_cooldown_remaining = 0
+        req.dflash_adaptive_last_decision = None
         return init_bs
 
     def _resolve_runtime_block_size(self, batch: ScheduleBatch) -> int:
@@ -428,23 +444,99 @@ class DFlashWorker:
         proposed = max(0, int(runtime_block_size) - 1)
         accepted = max(0, int(accepted_draft_tokens))
         next_bs = int(current_bs)
-        if proposed == 0:
-            # k=1 has no drafted tokens; probe upward to avoid getting stuck.
-            accept_ratio = 1.0
-            next_bs = int(current_bs) + 1
-        else:
-            accept_ratio = float(accepted) / float(proposed)
-            # Simple per-cycle policy:
-            # 1) If acceptance is below threshold, reduce one block size.
-            # 2) If acceptance is perfect, increase one block size.
-            if accept_ratio < float(self._adaptive_low_accept_threshold):
-                next_bs = int(current_bs) - 1
-            elif accepted >= proposed:
-                next_bs = int(current_bs) + 1
+        step_size = max(1, int(math.ceil(max(float(self._adaptive_delta), 1e-8))))
 
+        if proposed == 0:
+            # k=1 has no drafted tokens; always probe upward to avoid deadlock at k=1.
+            accept_ratio = 1.0
+        else:
+            accept_ratio = max(0.0, min(1.0, float(accepted) / float(proposed)))
+
+        prev_ratio_ewma = getattr(req, "dflash_adaptive_accept_ratio_ewma", None)
+        if prev_ratio_ewma is None:
+            accept_ratio_ewma = float(accept_ratio)
+        else:
+            rho = max(0.0, min(1.0, float(self._adaptive_rho)))
+            accept_ratio_ewma = (1.0 - rho) * float(prev_ratio_ewma) + rho * float(
+                accept_ratio
+            )
+        req.dflash_adaptive_accept_ratio_ewma = float(accept_ratio_ewma)
         req.dflash_adaptive_last_accept_ratio = float(accept_ratio)
 
-        next_bs = int(min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max)))
+        prev_lgen_hat = getattr(req, "dflash_adaptive_lgen_hat", None)
+        prev_lacc_hat = getattr(req, "dflash_adaptive_lacc_hat", None)
+        if prev_lgen_hat is None:
+            lgen_hat = float(proposed)
+        else:
+            lgen_hat = (1.0 - self._adaptive_rho) * float(prev_lgen_hat) + self._adaptive_rho * float(
+                proposed
+            )
+        if prev_lacc_hat is None:
+            lacc_hat = float(accepted)
+        else:
+            lacc_hat = (1.0 - self._adaptive_rho) * float(prev_lacc_hat) + self._adaptive_rho * float(
+                accepted
+            )
+        req.dflash_adaptive_lgen_hat = float(lgen_hat)
+        req.dflash_adaptive_lacc_hat = float(lacc_hat)
+
+        low_count = int(getattr(req, "dflash_adaptive_low_accept_count", 0) or 0)
+        high_count = int(getattr(req, "dflash_adaptive_high_accept_count", 0) or 0)
+        cooldown_remaining = int(
+            getattr(req, "dflash_adaptive_cooldown_remaining", 0) or 0
+        )
+
+        if accept_ratio_ewma <= float(self._adaptive_low_accept_threshold):
+            low_count += 1
+            high_count = 0
+        elif accept_ratio_ewma >= float(self._adaptive_high_accept_threshold):
+            high_count += 1
+            low_count = 0
+        else:
+            low_count = 0
+            high_count = 0
+
+        action = "hold"
+        reason = "streak_not_met"
+        if proposed == 0:
+            next_bs = int(current_bs) + step_size
+            action = "up"
+            reason = "k1_probe_recover"
+            low_count = 0
+            high_count = 0
+        elif cooldown_remaining > 0:
+            cooldown_remaining -= 1
+            reason = "cooldown"
+        else:
+            # Smooth target from accepted-token EWMA with a small safety margin.
+            target_bs = int(round(float(lacc_hat) + 1.0 + float(self._adaptive_delta)))
+            target_bs = int(
+                min(max(target_bs, int(self._adaptive_k_min)), int(self._adaptive_k_max))
+            )
+            if low_count >= int(self._adaptive_low_accept_streak):
+                next_bs = min(int(current_bs) - step_size, target_bs)
+                action = "down"
+                reason = "low_accept_streak"
+                low_count = 0
+                cooldown_remaining = int(self._adaptive_cooldown_cycles)
+            elif high_count >= int(self._adaptive_high_accept_streak):
+                next_bs = max(int(current_bs) + step_size, target_bs)
+                action = "up"
+                reason = "high_accept_streak"
+                high_count = 0
+                cooldown_remaining = int(self._adaptive_cooldown_cycles)
+            else:
+                reason = "hysteresis_band"
+                next_bs = int(current_bs)
+
+        req.dflash_adaptive_low_accept_count = int(low_count)
+        req.dflash_adaptive_high_accept_count = int(high_count)
+        req.dflash_adaptive_cooldown_remaining = int(cooldown_remaining)
+
+        unclamped_next_bs = int(next_bs)
+        next_bs = int(
+            min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max))
+        )
         next_bs = self._clamp_runtime_block_size(next_bs)
         if self._adaptive_block_buckets:
             if next_bs > current_bs:
@@ -453,7 +545,26 @@ class DFlashWorker:
                 next_bs = self._snap_to_adaptive_bucket(next_bs, mode="floor")
             else:
                 next_bs = self._snap_to_adaptive_bucket(next_bs, mode="nearest")
+
+        if next_bs != unclamped_next_bs:
+            reason = "clamped_or_bucketed"
+
         req.dflash_adaptive_current_bs = next_bs
+        req.dflash_adaptive_last_decision = {
+            "prev_bs": int(current_bs),
+            "next_bs": int(next_bs),
+            "action": action,
+            "reason": reason,
+            "accept_ratio": float(accept_ratio),
+            "accept_ratio_ewma": float(accept_ratio_ewma),
+            "accepted_draft_tokens": int(accepted),
+            "proposed_draft_tokens": int(proposed),
+            "low_accept_count": int(low_count),
+            "high_accept_count": int(high_count),
+            "cooldown_remaining": int(cooldown_remaining),
+            "lgen_hat": float(lgen_hat),
+            "lacc_hat": float(lacc_hat),
+        }
 
     def _record_runtime_block_size_usage(
         self, batch: ScheduleBatch, runtime_block_size: int
@@ -550,6 +661,7 @@ class DFlashWorker:
                 if proposed_draft_tokens > 0
                 else None
             )
+            adaptive_decision = getattr(req, "dflash_adaptive_last_decision", None)
             trace.append(
                 {
                     "cycle_idx": int(getattr(req, "spec_verify_ct", 0)),
@@ -560,6 +672,7 @@ class DFlashWorker:
                     "accept_rate": accept_rate,
                     "draft_time_s": per_req_draft_time_s,
                     "verify_time_s": per_req_verify_time_s,
+                    "adaptive_decision": adaptive_decision,
                 }
             )
 
@@ -687,7 +800,11 @@ class DFlashWorker:
             req.dflash_adaptive_current_bs = None
             req.dflash_adaptive_lgen_hat = None
             req.dflash_adaptive_lacc_hat = None
+            req.dflash_adaptive_accept_ratio_ewma = None
             req.dflash_adaptive_low_accept_count = 0
+            req.dflash_adaptive_high_accept_count = 0
+            req.dflash_adaptive_cooldown_remaining = 0
+            req.dflash_adaptive_last_decision = None
             req.dflash_runtime_bs_hist = {}
         if hasattr(req, "spec_cycle_trace"):
             req.spec_cycle_trace = None

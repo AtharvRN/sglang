@@ -482,6 +482,9 @@ class ServerArgs:
     speculative_dflash_adaptive_k_start: Optional[int] = None
     speculative_dflash_adaptive_low_accept_threshold: float = 0.35
     speculative_dflash_adaptive_low_accept_streak: int = 2
+    speculative_dflash_adaptive_high_accept_threshold: float = 0.90
+    speculative_dflash_adaptive_high_accept_streak: int = 2
+    speculative_dflash_adaptive_cooldown_cycles: int = 1
     speculative_dflash_cycle_trace: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
@@ -2568,6 +2571,34 @@ class ServerArgs:
                         "DFLASH adaptive low-accept streak must be >= 1. "
                         f"Got {self.speculative_dflash_adaptive_low_accept_streak}."
                     )
+                if not (
+                    0.0
+                    <= float(self.speculative_dflash_adaptive_high_accept_threshold)
+                    <= 1.0
+                ):
+                    raise ValueError(
+                        "DFLASH adaptive high-accept threshold must be in [0,1]. "
+                        f"Got {self.speculative_dflash_adaptive_high_accept_threshold}."
+                    )
+                if (
+                    float(self.speculative_dflash_adaptive_high_accept_threshold)
+                    < float(self.speculative_dflash_adaptive_low_accept_threshold)
+                ):
+                    raise ValueError(
+                        "DFLASH adaptive high-accept threshold must be >= low-accept threshold. "
+                        f"Got high={self.speculative_dflash_adaptive_high_accept_threshold}, "
+                        f"low={self.speculative_dflash_adaptive_low_accept_threshold}."
+                    )
+                if int(self.speculative_dflash_adaptive_high_accept_streak) < 1:
+                    raise ValueError(
+                        "DFLASH adaptive high-accept streak must be >= 1. "
+                        f"Got {self.speculative_dflash_adaptive_high_accept_streak}."
+                    )
+                if int(self.speculative_dflash_adaptive_cooldown_cycles) < 0:
+                    raise ValueError(
+                        "DFLASH adaptive cooldown cycles must be >= 0. "
+                        f"Got {self.speculative_dflash_adaptive_cooldown_cycles}."
+                    )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -4281,6 +4312,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_dflash_adaptive_low_accept_streak,
             help="DFLASH adaptive consecutive low-accept cycles before forcing one-step block-size decrease.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-high-accept-threshold",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_high_accept_threshold,
+            help="DFLASH adaptive threshold on acceptance ratio EWMA for allowing one-step block-size increase.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-high-accept-streak",
+            type=int,
+            default=ServerArgs.speculative_dflash_adaptive_high_accept_streak,
+            help="DFLASH adaptive consecutive high-accept cycles before one-step block-size increase.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-cooldown-cycles",
+            type=int,
+            default=ServerArgs.speculative_dflash_adaptive_cooldown_cycles,
+            help="DFLASH adaptive hold cycles after a block-size change to reduce oscillation.",
         )
         parser.add_argument(
             "--speculative-dflash-cycle-trace",
