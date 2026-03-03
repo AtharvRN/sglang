@@ -425,19 +425,24 @@ class DFlashWorker:
             return
 
         current_bs = self._init_req_adaptive_state(req)
-        proposed = max(1, int(runtime_block_size) - 1)
+        proposed = max(0, int(runtime_block_size) - 1)
         accepted = max(0, int(accepted_draft_tokens))
-        accept_ratio = float(accepted) / float(proposed)
-        req.dflash_adaptive_last_accept_ratio = float(accept_ratio)
-
         next_bs = int(current_bs)
-        # Simple per-cycle policy:
-        # 1) If acceptance is below threshold, reduce one block size.
-        # 2) If acceptance is perfect, increase one block size.
-        if accept_ratio < float(self._adaptive_low_accept_threshold):
-            next_bs = int(current_bs) - 1
-        elif accepted >= proposed:
+        if proposed == 0:
+            # k=1 has no drafted tokens; probe upward to avoid getting stuck.
+            accept_ratio = 1.0
             next_bs = int(current_bs) + 1
+        else:
+            accept_ratio = float(accepted) / float(proposed)
+            # Simple per-cycle policy:
+            # 1) If acceptance is below threshold, reduce one block size.
+            # 2) If acceptance is perfect, increase one block size.
+            if accept_ratio < float(self._adaptive_low_accept_threshold):
+                next_bs = int(current_bs) - 1
+            elif accepted >= proposed:
+                next_bs = int(current_bs) + 1
+
+        req.dflash_adaptive_last_accept_ratio = float(accept_ratio)
 
         next_bs = int(min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max)))
         next_bs = self._clamp_runtime_block_size(next_bs)
