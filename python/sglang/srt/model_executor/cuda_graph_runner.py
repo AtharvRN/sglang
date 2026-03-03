@@ -808,10 +808,10 @@ class CudaGraphRunner:
                 self.model_runner.gpu_id,
                 empty_cache=False,
             )
-            # Reverse order (both token buckets and bs) to improve memory reuse.
-            for num_tokens_per_bs in sorted(
-                self.capture_num_tokens_per_bs, reverse=True
-            ):
+            # Capture token buckets in ascending order so the largest runtime
+            # token-per-batch shape is captured last. FlashInfer replay metadata
+            # uses this final shape capacity for graph mode planning.
+            for num_tokens_per_bs in sorted(self.capture_num_tokens_per_bs):
                 capture_bs = self.capture_bs_by_num_tokens[num_tokens_per_bs]
                 compile_bs = set(self.compile_bs_by_num_tokens[num_tokens_per_bs])
                 capture_range = (
