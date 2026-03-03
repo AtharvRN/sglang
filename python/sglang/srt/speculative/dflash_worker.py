@@ -31,6 +31,7 @@ from sglang.srt.utils import get_bool_env_var, is_cuda
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+_DFLASH_ADAPTIVE_BLOCK_BUCKETS = (8, 12, 16)
 
 
 def _get_fused_kv_materialize_helper():
@@ -180,6 +181,9 @@ class DFlashWorker:
         self._adaptive_low_accept_streak = int(
             server_args.speculative_dflash_adaptive_low_accept_streak
         )
+        self._adaptive_block_buckets: list[int] = []
+        if self._adaptive_block_size_enabled:
+            self._adaptive_block_buckets = self._build_adaptive_block_buckets()
         self._last_runtime_block_size = int(self.block_size)
 
         self._mask_token = draft_config.mask_token
@@ -206,6 +210,11 @@ class DFlashWorker:
                     self._adaptive_low_accept_threshold,
                     self._adaptive_low_accept_streak,
                 )
+                if self._adaptive_block_buckets:
+                    logger.info(
+                        "DFLASH adaptive block-size buckets enabled: %s",
+                        self._adaptive_block_buckets,
+                    )
             if self._report_cycle_trace:
                 logger.info("DFLASH per-cycle trace enabled.")
             logger.info(
@@ -247,6 +256,38 @@ class DFlashWorker:
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
+    def _build_adaptive_block_buckets(self) -> list[int]:
+        buckets = sorted(
+            {
+                int(v)
+                for v in _DFLASH_ADAPTIVE_BLOCK_BUCKETS
+                if int(v) >= int(self._adaptive_k_min)
+                and int(v) <= int(self._adaptive_k_max)
+                and int(v) <= int(self.block_size)
+            }
+        )
+        if len(buckets) == 0:
+            buckets = [int(min(max(int(self._adaptive_k_start), 1), int(self.block_size)))]
+        return buckets
+
+    def _snap_to_adaptive_bucket(self, value: int, mode: str = "nearest") -> int:
+        if not self._adaptive_block_buckets:
+            return int(value)
+        val = int(value)
+        buckets = self._adaptive_block_buckets
+        if mode == "floor":
+            for bucket in reversed(buckets):
+                if bucket <= val:
+                    return int(bucket)
+            return int(buckets[0])
+        if mode == "ceil":
+            for bucket in buckets:
+                if bucket >= val:
+                    return int(bucket)
+            return int(buckets[-1])
+        # nearest (tie -> smaller bucket)
+        return int(min(buckets, key=lambda b: (abs(int(b) - val), int(b))))
+
     def _clamp_runtime_block_size(self, value: int) -> int:
         return int(min(max(1, int(value)), int(self.block_size)))
 
@@ -255,7 +296,10 @@ class DFlashWorker:
             getattr(req, "dflash_adaptive_current_bs", None) is not None
             and int(req.dflash_adaptive_current_bs) >= 1
         ):
-            return self._clamp_runtime_block_size(req.dflash_adaptive_current_bs)
+            resolved = self._clamp_runtime_block_size(req.dflash_adaptive_current_bs)
+            if self._adaptive_block_buckets:
+                resolved = self._snap_to_adaptive_bucket(resolved, mode="nearest")
+            return resolved
 
         init_bs = int(self._adaptive_k_start if self._adaptive_block_size_enabled else self.block_size)
         sampling_params = getattr(req, "sampling_params", None)
@@ -280,6 +324,8 @@ class DFlashWorker:
 
         init_bs = self._clamp_runtime_block_size(init_bs)
         init_bs = int(min(max(init_bs, int(self._adaptive_k_min)), int(self._adaptive_k_max)))
+        if self._adaptive_block_buckets:
+            init_bs = self._snap_to_adaptive_bucket(init_bs, mode="nearest")
 
         req.dflash_adaptive_current_bs = init_bs
         req.dflash_adaptive_lgen_hat = None
@@ -422,6 +468,13 @@ class DFlashWorker:
 
         next_bs = int(min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max)))
         next_bs = self._clamp_runtime_block_size(next_bs)
+        if self._adaptive_block_buckets:
+            if next_bs > current_bs:
+                next_bs = self._snap_to_adaptive_bucket(next_bs, mode="ceil")
+            elif next_bs < current_bs:
+                next_bs = self._snap_to_adaptive_bucket(next_bs, mode="floor")
+            else:
+                next_bs = self._snap_to_adaptive_bucket(next_bs, mode="nearest")
         req.dflash_adaptive_current_bs = next_bs
 
     def _record_runtime_block_size_usage(
