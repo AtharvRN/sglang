@@ -694,6 +694,18 @@ class CudaGraphRunner:
         if runtime_num_tokens_per_bs is None:
             return False
 
+        # FlashInfer currently shows instability with adaptive DFLASH when replaying
+        # CUDA graphs captured at multiple token-per-batch shapes in one process.
+        # Keep graph replay on the canonical max DFLASH block size and fall back to
+        # eager execution for smaller adaptive buckets.
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.server_args.speculative_dflash_adaptive_block_size
+            and self.model_runner.server_args.attention_backend == "flashinfer"
+            and int(runtime_num_tokens_per_bs) != int(self.num_tokens_per_bs)
+        ):
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // runtime_num_tokens_per_bs
