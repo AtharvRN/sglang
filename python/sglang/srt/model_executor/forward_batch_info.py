@@ -483,7 +483,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
-            ret.positions = ret.spec_info.positions
+            # Some speculative paths build positions from sliced 2D buffers.
+            # Ensure 1D contiguous layout for fused RoPE kernels.
+            ret.positions = ret.spec_info.positions.contiguous()
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():

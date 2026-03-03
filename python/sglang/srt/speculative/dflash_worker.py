@@ -812,7 +812,9 @@ class DFlashWorker:
             self._block_pos_offsets[:runtime_block_size],
             out=positions_2d,
         )
-        positions = positions_2d.reshape(-1)
+        # runtime_block_size can be < max block_size, making this view non-contiguous.
+        # The fused RoPE kernel requires contiguous position tensors.
+        positions = positions_2d.reshape(-1).contiguous()
 
         block_start = prefix_lens
         block_end = self._draft_block_end_buf[:bs]
@@ -870,7 +872,7 @@ class DFlashWorker:
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
-                input_ids=block_ids.flatten(),
+                input_ids=block_ids.reshape(-1).contiguous(),
                 req_pool_indices=batch.req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=block_cache_loc,
@@ -905,10 +907,10 @@ class DFlashWorker:
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         if runtime_block_size > 1:
             draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+        positions = positions_2d.reshape(-1).contiguous()
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
+            draft_token=draft_tokens.reshape(-1).contiguous(),
             positions=positions,
             draft_token_num=runtime_block_size,
         )
