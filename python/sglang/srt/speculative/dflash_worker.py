@@ -157,8 +157,18 @@ class DFlashWorker:
         self._adaptive_block_size_enabled = bool(
             server_args.speculative_dflash_adaptive_block_size
         )
+        self._adaptive_algo = str(
+            server_args.speculative_dflash_adaptive_algo
+        ).lower()
         self._adaptive_rho = float(server_args.speculative_dflash_adaptive_rho)
         self._adaptive_delta = float(server_args.speculative_dflash_adaptive_delta)
+        self._adaptive_reward_mode = str(
+            server_args.speculative_dflash_adaptive_reward_mode
+        ).lower()
+        self._adaptive_ucb_c = float(server_args.speculative_dflash_adaptive_ucb_c)
+        self._adaptive_ucb_delta = float(
+            server_args.speculative_dflash_adaptive_ucb_delta
+        )
         self._adaptive_k_min = (
             int(server_args.speculative_dflash_adaptive_k_min)
             if server_args.speculative_dflash_adaptive_k_min is not None
@@ -209,12 +219,20 @@ class DFlashWorker:
             )
             if self._adaptive_block_size_enabled:
                 logger.info(
-                    "DFLASH adaptive block size enabled. k_min=%d k_max=%d k_start=%d rho=%.3f delta=%.3f low_accept_threshold=%.3f low_accept_streak=%d high_accept_threshold=%.3f high_accept_streak=%d cooldown_cycles=%d",
+                    "DFLASH adaptive block size enabled. "
+                    "algo=%s reward_mode=%s k_min=%d k_max=%d k_start=%d "
+                    "rho=%.3f delta=%.3f ucb_c=%.3f ucb_delta=%.4f "
+                    "low_accept_threshold=%.3f low_accept_streak=%d "
+                    "high_accept_threshold=%.3f high_accept_streak=%d cooldown_cycles=%d",
+                    self._adaptive_algo,
+                    self._adaptive_reward_mode,
                     self._adaptive_k_min,
                     self._adaptive_k_max,
                     self._adaptive_k_start,
                     self._adaptive_rho,
                     self._adaptive_delta,
+                    self._adaptive_ucb_c,
+                    self._adaptive_ucb_delta,
                     self._adaptive_low_accept_threshold,
                     self._adaptive_low_accept_streak,
                     self._adaptive_high_accept_threshold,
@@ -313,6 +331,77 @@ class DFlashWorker:
     def _clamp_runtime_block_size(self, value: int) -> int:
         return int(min(max(1, int(value)), int(self.block_size)))
 
+    def _adaptive_arms(self) -> list[int]:
+        if self._adaptive_block_buckets:
+            return [int(v) for v in self._adaptive_block_buckets]
+        lower = int(max(1, int(self._adaptive_k_min)))
+        upper = int(min(int(self._adaptive_k_max), int(self.block_size)))
+        if upper < lower:
+            upper = lower
+        return list(range(lower, upper + 1))
+
+    def _ensure_req_ucb_state(self, req) -> tuple[dict[int, int], dict[int, float]]:
+        arms = self._adaptive_arms()
+        counts = getattr(req, "dflash_adaptive_ucb_counts", None)
+        reward_sums = getattr(req, "dflash_adaptive_ucb_reward_sums", None)
+        if not isinstance(counts, dict):
+            counts = {}
+        if not isinstance(reward_sums, dict):
+            reward_sums = {}
+
+        # Keep state aligned with current arm space.
+        normalized_counts: dict[int, int] = {}
+        normalized_sums: dict[int, float] = {}
+        for arm in arms:
+            arm_i = int(arm)
+            normalized_counts[arm_i] = int(counts.get(arm_i, 0) or 0)
+            normalized_sums[arm_i] = float(reward_sums.get(arm_i, 0.0) or 0.0)
+
+        req.dflash_adaptive_ucb_counts = normalized_counts
+        req.dflash_adaptive_ucb_reward_sums = normalized_sums
+        if getattr(req, "dflash_adaptive_ucb_rounds", None) is None:
+            req.dflash_adaptive_ucb_rounds = 0
+        if getattr(req, "dflash_adaptive_ucb_reward_norm_max", None) is None:
+            req.dflash_adaptive_ucb_reward_norm_max = 1.0
+        return normalized_counts, normalized_sums
+
+    def _compute_ucb_reward(
+        self,
+        *,
+        req,
+        accepted_draft_tokens: int,
+        draft_time_s: float,
+        verify_time_s: float,
+        num_active_reqs: int,
+    ) -> tuple[float, str, float]:
+        # Include the target bonus token to match cycle-level accept length.
+        accept_length = float(max(0, int(accepted_draft_tokens)) + 1)
+
+        if self._adaptive_reward_mode != "throughput":
+            return accept_length, "accept_length", accept_length
+
+        if (
+            not self._report_timing
+            or draft_time_s <= 0.0
+            or verify_time_s <= 0.0
+            or num_active_reqs <= 0
+        ):
+            # Timing is not always enabled in deployment; fall back to token-based reward.
+            return accept_length, "accept_length_fallback_no_timing", accept_length
+
+        per_req_cycle_time_s = (float(draft_time_s) + float(verify_time_s)) / float(
+            max(num_active_reqs, 1)
+        )
+        raw = accept_length / max(per_req_cycle_time_s, 1e-6)
+
+        # Normalize to [0, 1] using running max to keep UCB numerically stable.
+        reward_norm_max = float(
+            max(getattr(req, "dflash_adaptive_ucb_reward_norm_max", 1.0), raw, 1e-6)
+        )
+        req.dflash_adaptive_ucb_reward_norm_max = reward_norm_max
+        reward = raw / reward_norm_max
+        return reward, "throughput", raw
+
     def _init_req_adaptive_state(self, req) -> int:
         if (
             getattr(req, "dflash_adaptive_current_bs", None) is not None
@@ -321,6 +410,8 @@ class DFlashWorker:
             resolved = self._clamp_runtime_block_size(req.dflash_adaptive_current_bs)
             if self._adaptive_block_buckets:
                 resolved = self._snap_to_adaptive_bucket(resolved, mode="nearest")
+            if self._adaptive_algo == "ucb":
+                self._ensure_req_ucb_state(req)
             return resolved
 
         init_bs = int(self._adaptive_k_start if self._adaptive_block_size_enabled else self.block_size)
@@ -357,6 +448,11 @@ class DFlashWorker:
         req.dflash_adaptive_high_accept_count = 0
         req.dflash_adaptive_cooldown_remaining = 0
         req.dflash_adaptive_last_decision = None
+        if self._adaptive_algo == "ucb":
+            self._ensure_req_ucb_state(req)
+            req.dflash_adaptive_ucb_rounds = 0
+            req.dflash_adaptive_ucb_reward_norm_max = 1.0
+            req.dflash_adaptive_ucb_last_scores = None
         return init_bs
 
     def _resolve_runtime_block_size(self, batch: ScheduleBatch) -> int:
@@ -450,7 +546,14 @@ class DFlashWorker:
         return effective_block_size
 
     def _update_req_adaptive_state(
-        self, req, *, accepted_draft_tokens: int, runtime_block_size: int
+        self,
+        req,
+        *,
+        accepted_draft_tokens: int,
+        runtime_block_size: int,
+        draft_time_s: float = 0.0,
+        verify_time_s: float = 0.0,
+        num_active_reqs: int = 1,
     ) -> None:
         if not self._adaptive_block_size_enabled:
             return
@@ -458,6 +561,161 @@ class DFlashWorker:
         current_bs = self._init_req_adaptive_state(req)
         proposed = max(0, int(runtime_block_size) - 1)
         accepted = max(0, int(accepted_draft_tokens))
+        accept_ratio = (
+            max(0.0, min(1.0, float(accepted) / float(proposed)))
+            if proposed > 0
+            else 1.0
+        )
+
+        if self._adaptive_algo == "ucb":
+            counts, reward_sums = self._ensure_req_ucb_state(req)
+            arms = sorted(int(a) for a in counts.keys())
+
+            pulled_arm = int(runtime_block_size)
+            pulled_arm = int(
+                min(max(pulled_arm, int(self._adaptive_k_min)), int(self._adaptive_k_max))
+            )
+            pulled_arm = self._clamp_runtime_block_size(pulled_arm)
+            if self._adaptive_block_buckets:
+                pulled_arm = self._snap_to_adaptive_bucket(pulled_arm, mode="nearest")
+            if pulled_arm not in counts:
+                counts[pulled_arm] = 0
+                reward_sums[pulled_arm] = 0.0
+                arms = sorted(int(a) for a in counts.keys())
+
+            reward, reward_source, reward_raw = self._compute_ucb_reward(
+                req=req,
+                accepted_draft_tokens=accepted,
+                draft_time_s=float(draft_time_s),
+                verify_time_s=float(verify_time_s),
+                num_active_reqs=int(num_active_reqs),
+            )
+
+            counts[pulled_arm] = int(counts[pulled_arm]) + 1
+            reward_sums[pulled_arm] = float(reward_sums[pulled_arm]) + float(reward)
+            rounds = int(getattr(req, "dflash_adaptive_ucb_rounds", 0) or 0) + 1
+            req.dflash_adaptive_ucb_rounds = int(rounds)
+
+            unseen_arms = [int(a) for a in arms if int(counts.get(int(a), 0)) == 0]
+            means: dict[int, float] = {}
+            bonuses: dict[int, float] = {}
+            scores: dict[int, float] = {}
+            if unseen_arms:
+                next_bs = int(unseen_arms[0])
+                reason = "ucb_warmup"
+            else:
+                num_arms = max(len(arms), 1)
+                if self._adaptive_reward_mode == "accept_length":
+                    l_bound = float(max(int(self.block_size), 1))
+                    delta = max(float(self._adaptive_ucb_delta), 1e-12)
+                    for arm in arms:
+                        n = float(max(int(counts.get(arm, 0)), 1))
+                        mean = float(reward_sums.get(arm, 0.0)) / n
+                        log_arg = (
+                            float(num_arms)
+                            * float(max(rounds, 1) ** 2)
+                            * math.sqrt(1.0 + n)
+                            / delta
+                        )
+                        inner = 1.0 + 2.0 * math.log(max(log_arg, 1.0000001))
+                        bonus = (l_bound / 2.0) * math.sqrt(
+                            ((1.0 + n) / (n * n)) * max(inner, 0.0)
+                        )
+                        means[arm] = float(mean)
+                        bonuses[arm] = float(bonus)
+                        scores[arm] = float(mean + bonus)
+                else:
+                    c = max(float(self._adaptive_ucb_c), 0.0)
+                    log_t = math.log(max(float(rounds), 2.0))
+                    for arm in arms:
+                        n = float(max(int(counts.get(arm, 0)), 1))
+                        mean = float(reward_sums.get(arm, 0.0)) / n
+                        bonus = c * math.sqrt((2.0 * log_t) / n)
+                        means[arm] = float(mean)
+                        bonuses[arm] = float(bonus)
+                        scores[arm] = float(mean + bonus)
+                next_bs = int(max(arms, key=lambda a: (scores[a], -int(a))))
+                reason = "ucb_score"
+
+            action = "hold"
+            if next_bs > int(current_bs):
+                action = "up"
+            elif next_bs < int(current_bs):
+                action = "down"
+
+            unclamped_next_bs = int(next_bs)
+            next_bs = int(
+                min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max))
+            )
+            next_bs = self._clamp_runtime_block_size(next_bs)
+            if self._adaptive_block_buckets:
+                next_bs = self._snap_to_adaptive_bucket(next_bs, mode="nearest")
+            if next_bs != unclamped_next_bs:
+                reason = "clamped_or_bucketed"
+                if next_bs > int(current_bs):
+                    action = "up"
+                elif next_bs < int(current_bs):
+                    action = "down"
+                else:
+                    action = "hold"
+
+            old_ratio_ewma = getattr(req, "dflash_adaptive_accept_ratio_ewma", None)
+            if old_ratio_ewma is None:
+                accept_ratio_ewma = float(accept_ratio)
+            else:
+                accept_ratio_ewma = float(
+                    (1.0 - self._adaptive_rho) * float(old_ratio_ewma)
+                    + self._adaptive_rho * float(accept_ratio)
+                )
+
+            req.dflash_adaptive_current_bs = int(next_bs)
+            req.dflash_adaptive_lgen_hat = None
+            req.dflash_adaptive_lacc_hat = None
+            req.dflash_adaptive_accept_ratio_ewma = float(accept_ratio_ewma)
+            req.dflash_adaptive_low_accept_count = 0
+            req.dflash_adaptive_high_accept_count = 0
+            req.dflash_adaptive_cooldown_remaining = 0
+            req.dflash_adaptive_ucb_last_scores = (
+                {int(a): float(scores[a]) for a in scores} if scores else None
+            )
+            req.dflash_adaptive_last_decision = {
+                "algo": "ucb",
+                "reward_mode": self._adaptive_reward_mode,
+                "reward_source": reward_source,
+                "reward": float(reward),
+                "reward_raw": float(reward_raw),
+                "ucb_round": int(rounds),
+                "ucb_pulled_arm": int(pulled_arm),
+                "ucb_pulled_arm_count": int(counts.get(pulled_arm, 0)),
+                "ucb_pulled_arm_mean_reward": float(
+                    float(reward_sums.get(pulled_arm, 0.0))
+                    / float(max(int(counts.get(pulled_arm, 0)), 1))
+                ),
+                "ucb_selected_mean_reward": (
+                    float(means[next_bs]) if next_bs in means else None
+                ),
+                "ucb_selected_bonus": (
+                    float(bonuses[next_bs]) if next_bs in bonuses else None
+                ),
+                "ucb_selected_score": (
+                    float(scores[next_bs]) if next_bs in scores else None
+                ),
+                "prev_bs": int(current_bs),
+                "next_bs": int(next_bs),
+                "action": action,
+                "reason": reason,
+                "accept_ratio": float(accept_ratio),
+                "accept_ratio_ewma": float(accept_ratio_ewma),
+                "accepted_draft_tokens": int(accepted),
+                "proposed_draft_tokens": int(proposed),
+                "low_accept_count": 0,
+                "high_accept_count": 0,
+                "cooldown_remaining": 0,
+                "lgen_hat": None,
+                "lacc_hat": None,
+            }
+            return
+
         action = "hold"
         reason = "ewma_hold"
 
@@ -504,7 +762,6 @@ class DFlashWorker:
             action = "up"
             reason = "k1_probe_recover"
         else:
-            accept_ratio = max(0.0, min(1.0, float(accepted) / float(proposed)))
             if accept_ratio < float(self._adaptive_low_accept_threshold):
                 low_count += 1
             else:
@@ -544,6 +801,8 @@ class DFlashWorker:
         )
         req.dflash_adaptive_accept_ratio_ewma = float(accept_ratio_ewma)
         req.dflash_adaptive_last_decision = {
+            "algo": "ewma",
+            "reward_mode": "accept_length",
             "prev_bs": int(current_bs),
             "next_bs": int(next_bs),
             "action": action,
@@ -798,6 +1057,11 @@ class DFlashWorker:
             req.dflash_adaptive_high_accept_count = 0
             req.dflash_adaptive_cooldown_remaining = 0
             req.dflash_adaptive_last_decision = None
+            req.dflash_adaptive_ucb_counts = {}
+            req.dflash_adaptive_ucb_reward_sums = {}
+            req.dflash_adaptive_ucb_rounds = 0
+            req.dflash_adaptive_ucb_reward_norm_max = 1.0
+            req.dflash_adaptive_ucb_last_scores = None
             req.dflash_runtime_bs_hist = {}
         if hasattr(req, "spec_cycle_trace"):
             req.spec_cycle_trace = None
@@ -1588,6 +1852,9 @@ class DFlashWorker:
                     req,
                     accepted_draft_tokens=int(accepted_draft_tokens),
                     runtime_block_size=runtime_bs,
+                    draft_time_s=float(self._last_draft_time_s),
+                    verify_time_s=float(verify_time_s),
+                    num_active_reqs=len(batch.reqs),
                 )
         self._record_cycle_trace(
             batch=batch,

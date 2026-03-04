@@ -475,8 +475,14 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_adaptive_block_size: bool = False
+    speculative_dflash_adaptive_algo: Literal["ewma", "ucb"] = "ewma"
     speculative_dflash_adaptive_rho: float = 0.3
     speculative_dflash_adaptive_delta: float = 1.0
+    speculative_dflash_adaptive_reward_mode: Literal[
+        "accept_length", "throughput"
+    ] = "accept_length"
+    speculative_dflash_adaptive_ucb_c: float = 1.0
+    speculative_dflash_adaptive_ucb_delta: float = 0.05
     speculative_dflash_adaptive_k_min: Optional[int] = None
     speculative_dflash_adaptive_k_max: Optional[int] = None
     speculative_dflash_adaptive_k_start: Optional[int] = None
@@ -2498,16 +2504,48 @@ class ServerArgs:
                 self.speculative_num_draft_tokens = inferred_block_size
 
             if self.speculative_dflash_adaptive_block_size:
-                if not (0.0 < float(self.speculative_dflash_adaptive_rho) <= 1.0):
+                adaptive_algo = str(self.speculative_dflash_adaptive_algo).lower().strip()
+                if adaptive_algo not in ("ewma", "ucb"):
                     raise ValueError(
-                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-rho in (0, 1]. "
-                        f"Got {self.speculative_dflash_adaptive_rho}."
+                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-algo "
+                        "to be one of {ewma, ucb}. "
+                        f"Got {self.speculative_dflash_adaptive_algo!r}."
                     )
-                if float(self.speculative_dflash_adaptive_delta) < 0.0:
+                self.speculative_dflash_adaptive_algo = adaptive_algo
+
+                reward_mode = (
+                    str(self.speculative_dflash_adaptive_reward_mode).lower().strip()
+                )
+                if reward_mode not in ("accept_length", "throughput"):
                     raise ValueError(
-                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-delta >= 0. "
-                        f"Got {self.speculative_dflash_adaptive_delta}."
+                        "DFLASH adaptive mode requires --speculative-dflash-adaptive-reward-mode "
+                        "to be one of {accept_length, throughput}. "
+                        f"Got {self.speculative_dflash_adaptive_reward_mode!r}."
                     )
+                self.speculative_dflash_adaptive_reward_mode = reward_mode
+
+                if adaptive_algo == "ewma":
+                    if not (0.0 < float(self.speculative_dflash_adaptive_rho) <= 1.0):
+                        raise ValueError(
+                            "DFLASH adaptive EWMA mode requires --speculative-dflash-adaptive-rho in (0, 1]. "
+                            f"Got {self.speculative_dflash_adaptive_rho}."
+                        )
+                    if float(self.speculative_dflash_adaptive_delta) < 0.0:
+                        raise ValueError(
+                            "DFLASH adaptive EWMA mode requires --speculative-dflash-adaptive-delta >= 0. "
+                            f"Got {self.speculative_dflash_adaptive_delta}."
+                        )
+                else:
+                    if float(self.speculative_dflash_adaptive_ucb_c) < 0.0:
+                        raise ValueError(
+                            "DFLASH adaptive UCB mode requires --speculative-dflash-adaptive-ucb-c >= 0. "
+                            f"Got {self.speculative_dflash_adaptive_ucb_c}."
+                        )
+                    if not (0.0 < float(self.speculative_dflash_adaptive_ucb_delta) < 1.0):
+                        raise ValueError(
+                            "DFLASH adaptive UCB mode requires --speculative-dflash-adaptive-ucb-delta in (0, 1). "
+                            f"Got {self.speculative_dflash_adaptive_ucb_delta}."
+                        )
 
                 k_min = (
                     1
@@ -4310,6 +4348,13 @@ class ServerArgs:
             help="DFLASH only. Enable server-side adaptive block size (updated per-request from acceptance history).",
         )
         parser.add_argument(
+            "--speculative-dflash-adaptive-algo",
+            type=str,
+            default=ServerArgs.speculative_dflash_adaptive_algo,
+            choices=["ewma", "ucb"],
+            help="DFLASH adaptive controller algorithm.",
+        )
+        parser.add_argument(
             "--speculative-dflash-adaptive-rho",
             type=float,
             default=ServerArgs.speculative_dflash_adaptive_rho,
@@ -4320,6 +4365,29 @@ class ServerArgs:
             type=float,
             default=ServerArgs.speculative_dflash_adaptive_delta,
             help="DFLASH adaptive growth increment for proposal length when acceptance keeps up.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-reward-mode",
+            type=str,
+            default=ServerArgs.speculative_dflash_adaptive_reward_mode,
+            choices=["accept_length", "throughput"],
+            help=(
+                "DFLASH adaptive reward mode. "
+                "accept_length uses accepted tokens per cycle; "
+                "throughput uses accepted tokens divided by attributed draft+verify cycle time."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-ucb-c",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_ucb_c,
+            help="DFLASH adaptive UCB exploration coefficient (used in generic UCB bonus).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-ucb-delta",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_ucb_delta,
+            help="DFLASH adaptive UCBSPEC confidence parameter delta in (0,1).",
         )
         parser.add_argument(
             "--speculative-dflash-adaptive-k-min",
