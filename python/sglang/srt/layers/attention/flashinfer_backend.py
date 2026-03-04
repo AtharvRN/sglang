@@ -296,8 +296,32 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
-        self.prefill_cuda_graph_metadata = {}  # For verify
+        # Keyed by (capture_bs, forward_mode_name, draft_token_bucket).
+        # draft_token_bucket matters for speculative prefill modes where the
+        # runtime draft length changes across steps.
+        self.prefill_cuda_graph_metadata = {}  # For verify/draft extend
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+    def _get_prefill_cuda_graph_key(
+        self,
+        bs: int,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+        num_tokens: Optional[int] = None,
+    ) -> tuple[int, str, int]:
+        draft_token_bucket = 0
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            runtime_draft_token_num = (
+                getattr(spec_info, "draft_token_num", None)
+                if spec_info is not None
+                else None
+            )
+            if runtime_draft_token_num is None and num_tokens is not None:
+                runtime_draft_token_num = int(num_tokens)
+            if runtime_draft_token_num is None:
+                runtime_draft_token_num = 1
+            draft_token_bucket = int(runtime_draft_token_num)
+        return (int(bs), forward_mode.name, draft_token_bucket)
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -631,7 +655,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            prefill_key = self._get_prefill_cuda_graph_key(
+                bs=bs,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                num_tokens=num_tokens,
+            )
+            self.prefill_cuda_graph_metadata[prefill_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -661,7 +691,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            prefill_key = self._get_prefill_cuda_graph_key(
+                bs=bs,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                num_tokens=num_tokens,
+            )
+            self.prefill_cuda_graph_metadata[prefill_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_dllm_extend():
             prefill_wrappers = []
@@ -690,7 +726,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            prefill_key = self._get_prefill_cuda_graph_key(
+                bs=bs,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                num_tokens=num_tokens,
+            )
+            self.prefill_cuda_graph_metadata[prefill_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -719,37 +761,71 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
+            prefill_key = self._get_prefill_cuda_graph_key(
+                bs=bs, forward_mode=forward_mode, spec_info=spec_info
+            )
+            prefill_wrappers = self.prefill_cuda_graph_metadata.get(prefill_key)
+            if prefill_wrappers is None:
+                legacy_wrappers = self.prefill_cuda_graph_metadata.get(bs)
+                if legacy_wrappers is None:
+                    raise KeyError(
+                        f"Missing FlashInfer prefill CUDA-graph metadata for key={prefill_key}. "
+                        "This usually means replay is requesting a draft-token bucket that was not captured."
+                    )
+                prefill_wrappers = legacy_wrappers
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
         elif forward_mode.is_draft_extend():
+            prefill_key = self._get_prefill_cuda_graph_key(
+                bs=bs, forward_mode=forward_mode, spec_info=spec_info
+            )
+            prefill_wrappers = self.prefill_cuda_graph_metadata.get(prefill_key)
+            if prefill_wrappers is None:
+                legacy_wrappers = self.prefill_cuda_graph_metadata.get(bs)
+                if legacy_wrappers is None:
+                    raise KeyError(
+                        f"Missing FlashInfer draft-extend CUDA-graph metadata for key={prefill_key}."
+                    )
+                prefill_wrappers = legacy_wrappers
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            prefill_key = self._get_prefill_cuda_graph_key(
+                bs=bs, forward_mode=forward_mode, spec_info=spec_info
+            )
+            prefill_wrappers = self.prefill_cuda_graph_metadata.get(prefill_key)
+            if prefill_wrappers is None:
+                legacy_wrappers = self.prefill_cuda_graph_metadata.get(bs)
+                if legacy_wrappers is None:
+                    raise KeyError(
+                        f"Missing FlashInfer DLLM-extend CUDA-graph metadata for key={prefill_key}."
+                    )
+                prefill_wrappers = legacy_wrappers
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=prefill_wrappers,
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,

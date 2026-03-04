@@ -272,6 +272,21 @@ class DFlashWorker:
         lower = int(max(1, int(self._adaptive_k_min)))
         if upper < lower:
             upper = lower
+        configured_buckets = getattr(
+            self.server_args, "speculative_dflash_adaptive_block_buckets", None
+        )
+        if configured_buckets:
+            buckets = sorted(
+                {
+                    int(v)
+                    for v in configured_buckets
+                    if int(v) >= lower and int(v) <= upper
+                }
+            )
+            if len(buckets) > 0:
+                return buckets
+
+        # Fallback to contiguous runtime block sizes when buckets are not configured.
         buckets = list(range(lower, upper + 1))
         if len(buckets) == 0:
             buckets = [int(min(max(int(self._adaptive_k_start), 1), int(self.block_size)))]

@@ -480,6 +480,7 @@ class ServerArgs:
     speculative_dflash_adaptive_k_min: Optional[int] = None
     speculative_dflash_adaptive_k_max: Optional[int] = None
     speculative_dflash_adaptive_k_start: Optional[int] = None
+    speculative_dflash_adaptive_block_buckets: Optional[List[int]] = None
     speculative_dflash_adaptive_low_accept_threshold: float = 0.35
     speculative_dflash_adaptive_low_accept_streak: int = 2
     speculative_dflash_adaptive_high_accept_threshold: float = 0.90
@@ -2561,6 +2562,46 @@ class ServerArgs:
                 self.speculative_dflash_adaptive_k_max = k_max
                 self.speculative_dflash_adaptive_k_start = k_start
 
+                raw_bucket_values = self.speculative_dflash_adaptive_block_buckets
+                if raw_bucket_values:
+                    try:
+                        bucket_values = sorted({int(v) for v in raw_bucket_values})
+                    except Exception as e:
+                        raise ValueError(
+                            "DFLASH adaptive block buckets must be a list of integers. "
+                            f"Got {raw_bucket_values!r}."
+                        ) from e
+                    if len(bucket_values) == 0:
+                        raise ValueError(
+                            "DFLASH adaptive block buckets cannot be empty when provided."
+                        )
+                    for b in bucket_values:
+                        if b < k_min or b > k_max:
+                            raise ValueError(
+                                "DFLASH adaptive block buckets must be within [k_min, k_max]. "
+                                f"Got bucket={b}, k_min={k_min}, k_max={k_max}."
+                            )
+                    self.speculative_dflash_adaptive_block_buckets = bucket_values
+                else:
+                    # Auto-enable bucketed runtime shapes for FlashInfer + CUDA graph.
+                    # This keeps adaptive DFLASH replay on a bounded set of captured shapes.
+                    if self.attention_backend == "flashinfer" and not self.disable_cuda_graph:
+                        auto_buckets = sorted(
+                            {
+                                int(v)
+                                for v in (8, 12, 16)
+                                if int(v) >= k_min and int(v) <= k_max
+                            }
+                        )
+                        if len(auto_buckets) == 0:
+                            auto_buckets = [k_max]
+                        if k_max not in auto_buckets:
+                            auto_buckets.append(k_max)
+                            auto_buckets = sorted(set(auto_buckets))
+                        self.speculative_dflash_adaptive_block_buckets = auto_buckets
+                    else:
+                        self.speculative_dflash_adaptive_block_buckets = None
+
                 if not (0.0 <= float(self.speculative_dflash_adaptive_low_accept_threshold) <= 1.0):
                     raise ValueError(
                         "DFLASH adaptive low-accept threshold must be in [0,1]. "
@@ -4299,6 +4340,17 @@ class ServerArgs:
             help=(
                 "DFLASH adaptive initial runtime block size for each request. "
                 "Defaults to --speculative-num-draft-tokens."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-block-buckets",
+            type=int,
+            nargs="+",
+            default=ServerArgs.speculative_dflash_adaptive_block_buckets,
+            help=(
+                "DFLASH adaptive runtime block-size buckets for CUDA-graph routing "
+                "(e.g., 8 12 16). If unset, FlashInfer + CUDA graph auto-uses "
+                "{8,12,16} intersected with [k_min, k_max]."
             ),
         )
         parser.add_argument(

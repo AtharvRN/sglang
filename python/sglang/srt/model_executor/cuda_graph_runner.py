@@ -473,6 +473,7 @@ class CudaGraphRunner:
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
         self.capture_num_tokens_per_bs: List[int] = [1]
+        self._dflash_flashinfer_bucketed_replay_enabled = False
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
@@ -507,18 +508,41 @@ class CudaGraphRunner:
                     is not None
                     else self.num_tokens_per_bs
                 )
-                preferred_buckets = (8, 12, 16)
-                adaptive_buckets = sorted(
-                    {
-                        int(v)
-                        for v in preferred_buckets
-                        if int(v) >= k_min and int(v) <= k_max
-                    }
+                configured_buckets = getattr(
+                    self.model_runner.server_args,
+                    "speculative_dflash_adaptive_block_buckets",
+                    None,
+                )
+                adaptive_buckets = (
+                    sorted(
+                        {
+                            int(v)
+                            for v in configured_buckets
+                            if int(v) >= k_min and int(v) <= k_max
+                        }
+                    )
+                    if configured_buckets
+                    else []
                 )
                 if self.num_tokens_per_bs not in adaptive_buckets:
-                    adaptive_buckets.append(self.num_tokens_per_bs)
+                    adaptive_buckets.append(int(self.num_tokens_per_bs))
                     adaptive_buckets = sorted(set(adaptive_buckets))
                 self.capture_num_tokens_per_bs = adaptive_buckets
+                self._dflash_flashinfer_bucketed_replay_enabled = bool(
+                    self.model_runner.server_args.attention_backend == "flashinfer"
+                    and configured_buckets
+                    and len(adaptive_buckets) > 1
+                )
+                if (
+                    self.model_runner.server_args.attention_backend == "flashinfer"
+                    and len(adaptive_buckets) > 1
+                ):
+                    log_info_on_rank0(
+                        logger,
+                        "DFLASH FlashInfer bucketed cuda-graph replay is enabled. "
+                        "runtime token buckets=%s",
+                        adaptive_buckets,
+                    )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -694,17 +718,16 @@ class CudaGraphRunner:
         if runtime_num_tokens_per_bs is None:
             return False
 
-        # FlashInfer currently shows instability with adaptive DFLASH when replaying
-        # CUDA graphs captured at multiple token-per-batch shapes in one process.
-        # Keep graph replay on the canonical max DFLASH block size and fall back to
-        # eager execution for smaller adaptive buckets.
+        # For FlashInfer + adaptive DFLASH, allow non-canonical replay only when
+        # bucketed runtime shapes are explicitly configured.
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.server_args.speculative_dflash_adaptive_block_size
             and self.model_runner.server_args.attention_backend == "flashinfer"
             and int(runtime_num_tokens_per_bs) != int(self.num_tokens_per_bs)
         ):
-            return False
+            if not self._dflash_flashinfer_bucketed_replay_enabled:
+                return False
 
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
