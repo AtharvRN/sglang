@@ -540,8 +540,7 @@ class CudaGraphRunner:
                     log_info_on_rank0(
                         logger,
                         "DFLASH FlashInfer bucketed cuda-graph replay is enabled. "
-                        "runtime token buckets=%s",
-                        adaptive_buckets,
+                        f"runtime token buckets={adaptive_buckets}",
                     )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
