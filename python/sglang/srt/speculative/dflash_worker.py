@@ -169,6 +169,13 @@ class DFlashWorker:
         self._adaptive_ucb_delta = float(
             server_args.speculative_dflash_adaptive_ucb_delta
         )
+        self._adaptive_linucb_alpha = float(
+            server_args.speculative_dflash_adaptive_linucb_alpha
+        )
+        self._adaptive_linucb_lambda = float(
+            server_args.speculative_dflash_adaptive_linucb_lambda
+        )
+        self._adaptive_linucb_dim = 7
         self._adaptive_k_min = (
             int(server_args.speculative_dflash_adaptive_k_min)
             if server_args.speculative_dflash_adaptive_k_min is not None
@@ -222,6 +229,7 @@ class DFlashWorker:
                     "DFLASH adaptive block size enabled. "
                     "algo=%s reward_mode=%s k_min=%d k_max=%d k_start=%d "
                     "rho=%.3f delta=%.3f ucb_c=%.3f ucb_delta=%.4f "
+                    "linucb_alpha=%.3f linucb_lambda=%.3f "
                     "low_accept_threshold=%.3f low_accept_streak=%d "
                     "high_accept_threshold=%.3f high_accept_streak=%d cooldown_cycles=%d",
                     self._adaptive_algo,
@@ -233,6 +241,8 @@ class DFlashWorker:
                     self._adaptive_delta,
                     self._adaptive_ucb_c,
                     self._adaptive_ucb_delta,
+                    self._adaptive_linucb_alpha,
+                    self._adaptive_linucb_lambda,
                     self._adaptive_low_accept_threshold,
                     self._adaptive_low_accept_streak,
                     self._adaptive_high_accept_threshold,
@@ -365,6 +375,90 @@ class DFlashWorker:
             req.dflash_adaptive_ucb_reward_norm_max = 1.0
         return normalized_counts, normalized_sums
 
+    def _ensure_req_linucb_state(self, req):
+        arms = self._adaptive_arms()
+        dim = int(self._adaptive_linucb_dim)
+        lam = float(max(self._adaptive_linucb_lambda, 1e-9))
+
+        counts = getattr(req, "dflash_adaptive_linucb_counts", None)
+        a_inv = getattr(req, "dflash_adaptive_linucb_A_inv", None)
+        b_vec = getattr(req, "dflash_adaptive_linucb_b", None)
+        if not isinstance(counts, dict):
+            counts = {}
+        if not isinstance(a_inv, dict):
+            a_inv = {}
+        if not isinstance(b_vec, dict):
+            b_vec = {}
+
+        eye = torch.eye(dim, dtype=torch.float64, device="cpu") * (1.0 / lam)
+        normalized_counts: dict[int, int] = {}
+        normalized_a_inv: dict[int, torch.Tensor] = {}
+        normalized_b: dict[int, torch.Tensor] = {}
+
+        for arm in arms:
+            arm_i = int(arm)
+            normalized_counts[arm_i] = int(counts.get(arm_i, 0) or 0)
+
+            cur_a_inv = a_inv.get(arm_i, None)
+            if (
+                isinstance(cur_a_inv, torch.Tensor)
+                and cur_a_inv.dim() == 2
+                and int(cur_a_inv.shape[0]) == dim
+                and int(cur_a_inv.shape[1]) == dim
+            ):
+                normalized_a_inv[arm_i] = cur_a_inv.to(
+                    device="cpu", dtype=torch.float64
+                )
+            else:
+                normalized_a_inv[arm_i] = eye.clone()
+
+            cur_b = b_vec.get(arm_i, None)
+            if (
+                isinstance(cur_b, torch.Tensor)
+                and cur_b.dim() == 1
+                and int(cur_b.shape[0]) == dim
+            ):
+                normalized_b[arm_i] = cur_b.to(device="cpu", dtype=torch.float64)
+            else:
+                normalized_b[arm_i] = torch.zeros(dim, dtype=torch.float64, device="cpu")
+
+        req.dflash_adaptive_linucb_counts = normalized_counts
+        req.dflash_adaptive_linucb_A_inv = normalized_a_inv
+        req.dflash_adaptive_linucb_b = normalized_b
+        if getattr(req, "dflash_adaptive_linucb_rounds", None) is None:
+            req.dflash_adaptive_linucb_rounds = 0
+        return normalized_counts, normalized_a_inv, normalized_b
+
+    def _build_linucb_context(
+        self,
+        *,
+        req,
+        current_bs: int,
+        accept_ratio: float,
+        accepted_draft_tokens: int,
+        proposed_draft_tokens: int,
+        num_active_reqs: int,
+    ) -> torch.Tensor:
+        max_bs = float(max(int(self.block_size), 1))
+        max_running = float(max(int(self.server_args.max_running_requests or 1), 1))
+        cur_bs = float(max(1, int(current_bs)))
+        proposed = float(max(0, int(proposed_draft_tokens)))
+        accepted = float(max(0, int(accepted_draft_tokens)))
+        acc_ewma = getattr(req, "dflash_adaptive_accept_ratio_ewma", None)
+        if acc_ewma is None:
+            acc_ewma = float(accept_ratio)
+        acc_ewma = float(max(0.0, min(1.0, float(acc_ewma))))
+        context_vals = [
+            1.0,
+            cur_bs / max_bs,
+            float(max(1, int(num_active_reqs))) / max_running,
+            float(max(0.0, min(1.0, float(accept_ratio)))),
+            acc_ewma,
+            proposed / max(max_bs - 1.0, 1.0),
+            accepted / max(max_bs - 1.0, 1.0),
+        ]
+        return torch.tensor(context_vals, dtype=torch.float64, device="cpu")
+
     def _compute_ucb_reward(
         self,
         *,
@@ -412,6 +506,8 @@ class DFlashWorker:
                 resolved = self._snap_to_adaptive_bucket(resolved, mode="nearest")
             if self._adaptive_algo == "ucb":
                 self._ensure_req_ucb_state(req)
+            elif self._adaptive_algo == "linucb":
+                self._ensure_req_linucb_state(req)
             return resolved
 
         init_bs = int(self._adaptive_k_start if self._adaptive_block_size_enabled else self.block_size)
@@ -453,6 +549,10 @@ class DFlashWorker:
             req.dflash_adaptive_ucb_rounds = 0
             req.dflash_adaptive_ucb_reward_norm_max = 1.0
             req.dflash_adaptive_ucb_last_scores = None
+        elif self._adaptive_algo == "linucb":
+            self._ensure_req_linucb_state(req)
+            req.dflash_adaptive_linucb_rounds = 0
+            req.dflash_adaptive_linucb_last_scores = None
         return init_bs
 
     def _resolve_runtime_block_size(self, batch: ScheduleBatch) -> int:
@@ -700,6 +800,156 @@ class DFlashWorker:
                 "ucb_selected_score": (
                     float(scores[next_bs]) if next_bs in scores else None
                 ),
+                "prev_bs": int(current_bs),
+                "next_bs": int(next_bs),
+                "action": action,
+                "reason": reason,
+                "accept_ratio": float(accept_ratio),
+                "accept_ratio_ewma": float(accept_ratio_ewma),
+                "accepted_draft_tokens": int(accepted),
+                "proposed_draft_tokens": int(proposed),
+                "low_accept_count": 0,
+                "high_accept_count": 0,
+                "cooldown_remaining": 0,
+                "lgen_hat": None,
+                "lacc_hat": None,
+            }
+            return
+
+        if self._adaptive_algo == "linucb":
+            counts, a_inv_map, b_map = self._ensure_req_linucb_state(req)
+            arms = sorted(int(a) for a in counts.keys())
+
+            pulled_arm = int(runtime_block_size)
+            pulled_arm = int(
+                min(max(pulled_arm, int(self._adaptive_k_min)), int(self._adaptive_k_max))
+            )
+            pulled_arm = self._clamp_runtime_block_size(pulled_arm)
+            if self._adaptive_block_buckets:
+                pulled_arm = self._snap_to_adaptive_bucket(pulled_arm, mode="nearest")
+            if pulled_arm not in counts:
+                dim = int(self._adaptive_linucb_dim)
+                lam = float(max(self._adaptive_linucb_lambda, 1e-9))
+                counts[pulled_arm] = 0
+                a_inv_map[pulled_arm] = (
+                    torch.eye(dim, dtype=torch.float64, device="cpu") * (1.0 / lam)
+                )
+                b_map[pulled_arm] = torch.zeros(dim, dtype=torch.float64, device="cpu")
+                arms = sorted(int(a) for a in counts.keys())
+
+            context = self._build_linucb_context(
+                req=req,
+                current_bs=int(current_bs),
+                accept_ratio=float(accept_ratio),
+                accepted_draft_tokens=int(accepted),
+                proposed_draft_tokens=int(proposed),
+                num_active_reqs=int(num_active_reqs),
+            )
+            reward, reward_source, reward_raw = self._compute_ucb_reward(
+                req=req,
+                accepted_draft_tokens=accepted,
+                draft_time_s=float(draft_time_s),
+                verify_time_s=float(verify_time_s),
+                num_active_reqs=int(num_active_reqs),
+            )
+
+            # Online ridge update via Sherman-Morrison on A^{-1}.
+            a_inv = a_inv_map[pulled_arm]
+            b_vec = b_map[pulled_arm]
+            ax = torch.mv(a_inv, context)
+            denom = float(1.0 + torch.dot(context, ax))
+            if denom > 1e-12:
+                a_inv = a_inv - torch.ger(ax, ax) / denom
+            a_inv_map[pulled_arm] = a_inv
+            b_map[pulled_arm] = b_vec + float(reward) * context
+            counts[pulled_arm] = int(counts[pulled_arm]) + 1
+            rounds = int(getattr(req, "dflash_adaptive_linucb_rounds", 0) or 0) + 1
+            req.dflash_adaptive_linucb_rounds = int(rounds)
+
+            unseen_arms = [int(a) for a in arms if int(counts.get(int(a), 0)) == 0]
+            means: dict[int, float] = {}
+            bonuses: dict[int, float] = {}
+            scores: dict[int, float] = {}
+            if unseen_arms:
+                next_bs = int(unseen_arms[0])
+                reason = "linucb_warmup"
+            else:
+                alpha = float(max(self._adaptive_linucb_alpha, 0.0))
+                for arm in arms:
+                    arm_a_inv = a_inv_map[arm]
+                    arm_b = b_map[arm]
+                    theta = torch.mv(arm_a_inv, arm_b)
+                    mean = float(torch.dot(theta, context))
+                    quad = float(torch.dot(context, torch.mv(arm_a_inv, context)))
+                    bonus = alpha * math.sqrt(max(quad, 0.0))
+                    means[arm] = mean
+                    bonuses[arm] = bonus
+                    scores[arm] = mean + bonus
+                next_bs = int(max(arms, key=lambda a: (scores[a], -int(a))))
+                reason = "linucb_score"
+
+            action = "hold"
+            if next_bs > int(current_bs):
+                action = "up"
+            elif next_bs < int(current_bs):
+                action = "down"
+
+            unclamped_next_bs = int(next_bs)
+            next_bs = int(
+                min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max))
+            )
+            next_bs = self._clamp_runtime_block_size(next_bs)
+            if self._adaptive_block_buckets:
+                next_bs = self._snap_to_adaptive_bucket(next_bs, mode="nearest")
+            if next_bs != unclamped_next_bs:
+                reason = "clamped_or_bucketed"
+                if next_bs > int(current_bs):
+                    action = "up"
+                elif next_bs < int(current_bs):
+                    action = "down"
+                else:
+                    action = "hold"
+
+            old_ratio_ewma = getattr(req, "dflash_adaptive_accept_ratio_ewma", None)
+            if old_ratio_ewma is None:
+                accept_ratio_ewma = float(accept_ratio)
+            else:
+                accept_ratio_ewma = float(
+                    (1.0 - self._adaptive_rho) * float(old_ratio_ewma)
+                    + self._adaptive_rho * float(accept_ratio)
+                )
+
+            req.dflash_adaptive_current_bs = int(next_bs)
+            req.dflash_adaptive_lgen_hat = None
+            req.dflash_adaptive_lacc_hat = None
+            req.dflash_adaptive_accept_ratio_ewma = float(accept_ratio_ewma)
+            req.dflash_adaptive_low_accept_count = 0
+            req.dflash_adaptive_high_accept_count = 0
+            req.dflash_adaptive_cooldown_remaining = 0
+            req.dflash_adaptive_linucb_last_scores = (
+                {int(a): float(scores[a]) for a in scores} if scores else None
+            )
+            req.dflash_adaptive_last_decision = {
+                "algo": "linucb",
+                "reward_mode": self._adaptive_reward_mode,
+                "reward_source": reward_source,
+                "reward": float(reward),
+                "reward_raw": float(reward_raw),
+                "linucb_round": int(rounds),
+                "linucb_pulled_arm": int(pulled_arm),
+                "linucb_pulled_arm_count": int(counts.get(pulled_arm, 0)),
+                "linucb_selected_mean_reward": (
+                    float(means[next_bs]) if next_bs in means else None
+                ),
+                "linucb_selected_bonus": (
+                    float(bonuses[next_bs]) if next_bs in bonuses else None
+                ),
+                "linucb_selected_score": (
+                    float(scores[next_bs]) if next_bs in scores else None
+                ),
+                "linucb_alpha": float(self._adaptive_linucb_alpha),
+                "linucb_lambda": float(self._adaptive_linucb_lambda),
+                "linucb_context": [float(v) for v in context.tolist()],
                 "prev_bs": int(current_bs),
                 "next_bs": int(next_bs),
                 "action": action,
@@ -1062,6 +1312,11 @@ class DFlashWorker:
             req.dflash_adaptive_ucb_rounds = 0
             req.dflash_adaptive_ucb_reward_norm_max = 1.0
             req.dflash_adaptive_ucb_last_scores = None
+            req.dflash_adaptive_linucb_counts = {}
+            req.dflash_adaptive_linucb_rounds = 0
+            req.dflash_adaptive_linucb_A_inv = {}
+            req.dflash_adaptive_linucb_b = {}
+            req.dflash_adaptive_linucb_last_scores = None
             req.dflash_runtime_bs_hist = {}
         if hasattr(req, "spec_cycle_trace"):
             req.spec_cycle_trace = None

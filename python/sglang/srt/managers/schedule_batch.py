@@ -771,6 +771,11 @@ class Req(ReqDllmMixin):
         self.dflash_adaptive_ucb_rounds: int = 0
         self.dflash_adaptive_ucb_reward_norm_max: float = 1.0
         self.dflash_adaptive_ucb_last_scores: Optional[Dict[int, float]] = None
+        self.dflash_adaptive_linucb_counts: Dict[int, int] = {}
+        self.dflash_adaptive_linucb_rounds: int = 0
+        self.dflash_adaptive_linucb_A_inv: Dict[int, Any] = {}
+        self.dflash_adaptive_linucb_b: Dict[int, Any] = {}
+        self.dflash_adaptive_linucb_last_scores: Optional[Dict[int, float]] = None
         # DFLASH runtime block-size usage histogram for this request:
         # {runtime_block_size: verify_cycle_count}.
         self.dflash_runtime_bs_hist: Dict[int, int] = {}
