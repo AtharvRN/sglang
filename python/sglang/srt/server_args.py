@@ -475,7 +475,7 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_adaptive_block_size: bool = False
-    speculative_dflash_adaptive_algo: Literal["ewma", "ucb", "linucb"] = "ewma"
+    speculative_dflash_adaptive_algo: Literal["ewma", "ucb", "linucb", "thompson"] = "ewma"
     speculative_dflash_adaptive_rho: float = 0.3
     speculative_dflash_adaptive_delta: float = 1.0
     speculative_dflash_adaptive_reward_mode: Literal[
@@ -2508,10 +2508,10 @@ class ServerArgs:
 
             if self.speculative_dflash_adaptive_block_size:
                 adaptive_algo = str(self.speculative_dflash_adaptive_algo).lower().strip()
-                if adaptive_algo not in ("ewma", "ucb", "linucb"):
+                if adaptive_algo not in ("ewma", "ucb", "linucb", "thompson"):
                     raise ValueError(
                         "DFLASH adaptive mode requires --speculative-dflash-adaptive-algo "
-                        "to be one of {ewma, ucb, linucb}. "
+                        "to be one of {ewma, ucb, linucb, thompson}. "
                         f"Got {self.speculative_dflash_adaptive_algo!r}."
                     )
                 self.speculative_dflash_adaptive_algo = adaptive_algo
@@ -2558,7 +2558,7 @@ class ServerArgs:
                             "DFLASH adaptive UCB mode requires --speculative-dflash-adaptive-ucb-delta in (0, 1). "
                             f"Got {self.speculative_dflash_adaptive_ucb_delta}."
                         )
-                else:
+                elif adaptive_algo == "linucb":
                     if float(self.speculative_dflash_adaptive_linucb_alpha) < 0.0:
                         raise ValueError(
                             "DFLASH adaptive LinUCB mode requires --speculative-dflash-adaptive-linucb-alpha >= 0. "
@@ -4374,7 +4374,7 @@ class ServerArgs:
             "--speculative-dflash-adaptive-algo",
             type=str,
             default=ServerArgs.speculative_dflash_adaptive_algo,
-            choices=["ewma", "ucb", "linucb"],
+            choices=["ewma", "ucb", "linucb", "thompson"],
             help="DFLASH adaptive controller algorithm.",
         )
         parser.add_argument(

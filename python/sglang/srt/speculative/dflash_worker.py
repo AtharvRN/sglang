@@ -1,5 +1,6 @@
 import logging
 import math
+import random
 import time
 from copy import deepcopy
 from typing import Optional, Union
@@ -441,6 +442,39 @@ class DFlashWorker:
             req.dflash_adaptive_linucb_rounds = 0
         return normalized_counts, normalized_a_inv, normalized_b
 
+    def _ensure_req_thompson_state(
+        self, req
+    ) -> tuple[dict[int, int], dict[int, float], dict[int, float]]:
+        arms = self._adaptive_arms()
+        counts = getattr(req, "dflash_adaptive_thompson_counts", None)
+        alpha = getattr(req, "dflash_adaptive_thompson_alpha", None)
+        beta = getattr(req, "dflash_adaptive_thompson_beta", None)
+        if not isinstance(counts, dict):
+            counts = {}
+        if not isinstance(alpha, dict):
+            alpha = {}
+        if not isinstance(beta, dict):
+            beta = {}
+
+        normalized_counts: dict[int, int] = {}
+        normalized_alpha: dict[int, float] = {}
+        normalized_beta: dict[int, float] = {}
+        for arm in arms:
+            arm_i = int(arm)
+            normalized_counts[arm_i] = int(counts.get(arm_i, 0) or 0)
+            # Beta(1,1) prior by default.
+            normalized_alpha[arm_i] = float(alpha.get(arm_i, 1.0) or 1.0)
+            normalized_beta[arm_i] = float(beta.get(arm_i, 1.0) or 1.0)
+
+        req.dflash_adaptive_thompson_counts = normalized_counts
+        req.dflash_adaptive_thompson_alpha = normalized_alpha
+        req.dflash_adaptive_thompson_beta = normalized_beta
+        if getattr(req, "dflash_adaptive_thompson_rounds", None) is None:
+            req.dflash_adaptive_thompson_rounds = 0
+        if getattr(req, "dflash_adaptive_thompson_reward_norm_max", None) is None:
+            req.dflash_adaptive_thompson_reward_norm_max = 1.0
+        return normalized_counts, normalized_alpha, normalized_beta
+
     def _build_linucb_context(
         self,
         *,
@@ -565,6 +599,8 @@ class DFlashWorker:
                 self._ensure_req_ucb_state(req)
             elif self._adaptive_algo == "linucb":
                 self._ensure_req_linucb_state(req)
+            elif self._adaptive_algo == "thompson":
+                self._ensure_req_thompson_state(req)
             return resolved
 
         init_bs = int(self._adaptive_k_start if self._adaptive_block_size_enabled else self.block_size)
@@ -610,6 +646,11 @@ class DFlashWorker:
             self._ensure_req_linucb_state(req)
             req.dflash_adaptive_linucb_rounds = 0
             req.dflash_adaptive_linucb_last_scores = None
+        elif self._adaptive_algo == "thompson":
+            self._ensure_req_thompson_state(req)
+            req.dflash_adaptive_thompson_rounds = 0
+            req.dflash_adaptive_thompson_reward_norm_max = 1.0
+            req.dflash_adaptive_thompson_last_scores = None
         return init_bs
 
     def _resolve_runtime_block_size(self, batch: ScheduleBatch) -> int:
@@ -1025,6 +1066,138 @@ class DFlashWorker:
             }
             return
 
+        if self._adaptive_algo == "thompson":
+            counts, alpha_map, beta_map = self._ensure_req_thompson_state(req)
+            arms = sorted(int(a) for a in counts.keys())
+
+            pulled_arm = int(runtime_block_size)
+            pulled_arm = int(
+                min(max(pulled_arm, int(self._adaptive_k_min)), int(self._adaptive_k_max))
+            )
+            pulled_arm = self._clamp_runtime_block_size(pulled_arm)
+            if self._adaptive_block_buckets:
+                pulled_arm = self._snap_to_adaptive_bucket(pulled_arm, mode="nearest")
+            if pulled_arm not in counts:
+                counts[pulled_arm] = 0
+                alpha_map[pulled_arm] = 1.0
+                beta_map[pulled_arm] = 1.0
+                arms = sorted(int(a) for a in counts.keys())
+
+            reward, reward_source, reward_raw = self._compute_ucb_reward(
+                req=req,
+                accepted_draft_tokens=accepted,
+                runtime_block_size=int(runtime_block_size),
+                draft_time_s=float(draft_time_s),
+                verify_time_s=float(verify_time_s),
+                num_active_reqs=int(num_active_reqs),
+            )
+
+            reward_norm_max = float(
+                max(
+                    getattr(req, "dflash_adaptive_thompson_reward_norm_max", 1.0),
+                    float(reward),
+                    1e-6,
+                )
+            )
+            req.dflash_adaptive_thompson_reward_norm_max = reward_norm_max
+            reward_norm = float(float(reward) / reward_norm_max)
+            reward_norm = float(min(max(reward_norm, 0.0), 1.0))
+
+            alpha_map[pulled_arm] = float(alpha_map.get(pulled_arm, 1.0)) + float(
+                reward_norm
+            )
+            beta_map[pulled_arm] = float(beta_map.get(pulled_arm, 1.0)) + float(
+                1.0 - reward_norm
+            )
+            counts[pulled_arm] = int(counts[pulled_arm]) + 1
+            rounds = int(getattr(req, "dflash_adaptive_thompson_rounds", 0) or 0) + 1
+            req.dflash_adaptive_thompson_rounds = int(rounds)
+
+            unseen_arms = [int(a) for a in arms if int(counts.get(int(a), 0)) == 0]
+            samples: dict[int, float] = {}
+            if unseen_arms:
+                next_bs = int(unseen_arms[0])
+                reason = "thompson_warmup"
+            else:
+                for arm in arms:
+                    a = float(max(alpha_map.get(arm, 1.0), 1e-6))
+                    b = float(max(beta_map.get(arm, 1.0), 1e-6))
+                    samples[arm] = float(random.betavariate(a, b))
+                next_bs = int(max(arms, key=lambda a: (samples[a], -int(a))))
+                reason = "thompson_sample"
+
+            action = "hold"
+            if next_bs > int(current_bs):
+                action = "up"
+            elif next_bs < int(current_bs):
+                action = "down"
+
+            unclamped_next_bs = int(next_bs)
+            next_bs = int(
+                min(max(int(next_bs), int(self._adaptive_k_min)), int(self._adaptive_k_max))
+            )
+            next_bs = self._clamp_runtime_block_size(next_bs)
+            if self._adaptive_block_buckets:
+                next_bs = self._snap_to_adaptive_bucket(next_bs, mode="nearest")
+            if next_bs != unclamped_next_bs:
+                reason = "clamped_or_bucketed"
+                if next_bs > int(current_bs):
+                    action = "up"
+                elif next_bs < int(current_bs):
+                    action = "down"
+                else:
+                    action = "hold"
+
+            old_ratio_ewma = getattr(req, "dflash_adaptive_accept_ratio_ewma", None)
+            if old_ratio_ewma is None:
+                accept_ratio_ewma = float(accept_ratio)
+            else:
+                accept_ratio_ewma = float(
+                    (1.0 - self._adaptive_rho) * float(old_ratio_ewma)
+                    + self._adaptive_rho * float(accept_ratio)
+                )
+
+            req.dflash_adaptive_current_bs = int(next_bs)
+            req.dflash_adaptive_lgen_hat = None
+            req.dflash_adaptive_lacc_hat = None
+            req.dflash_adaptive_accept_ratio_ewma = float(accept_ratio_ewma)
+            req.dflash_adaptive_low_accept_count = 0
+            req.dflash_adaptive_high_accept_count = 0
+            req.dflash_adaptive_cooldown_remaining = 0
+            req.dflash_adaptive_thompson_last_scores = (
+                {int(a): float(samples[a]) for a in samples} if samples else None
+            )
+            req.dflash_adaptive_last_decision = {
+                "algo": "thompson",
+                "reward_mode": self._adaptive_reward_mode,
+                "reward_source": reward_source,
+                "reward": float(reward_norm),
+                "reward_raw": float(reward_raw),
+                "thompson_round": int(rounds),
+                "thompson_pulled_arm": int(pulled_arm),
+                "thompson_pulled_arm_count": int(counts.get(pulled_arm, 0)),
+                "thompson_pulled_arm_alpha": float(alpha_map.get(pulled_arm, 1.0)),
+                "thompson_pulled_arm_beta": float(beta_map.get(pulled_arm, 1.0)),
+                "thompson_reward_norm_max": float(reward_norm_max),
+                "thompson_selected_sample": (
+                    float(samples[next_bs]) if next_bs in samples else None
+                ),
+                "prev_bs": int(current_bs),
+                "next_bs": int(next_bs),
+                "action": action,
+                "reason": reason,
+                "accept_ratio": float(accept_ratio),
+                "accept_ratio_ewma": float(accept_ratio_ewma),
+                "accepted_draft_tokens": int(accepted),
+                "proposed_draft_tokens": int(proposed),
+                "low_accept_count": 0,
+                "high_accept_count": 0,
+                "cooldown_remaining": 0,
+                "lgen_hat": None,
+                "lacc_hat": None,
+            }
+            return
+
         action = "hold"
         reason = "ewma_hold"
 
@@ -1376,6 +1549,12 @@ class DFlashWorker:
             req.dflash_adaptive_linucb_A_inv = {}
             req.dflash_adaptive_linucb_b = {}
             req.dflash_adaptive_linucb_last_scores = None
+            req.dflash_adaptive_thompson_counts = {}
+            req.dflash_adaptive_thompson_alpha = {}
+            req.dflash_adaptive_thompson_beta = {}
+            req.dflash_adaptive_thompson_rounds = 0
+            req.dflash_adaptive_thompson_reward_norm_max = 1.0
+            req.dflash_adaptive_thompson_last_scores = None
             req.dflash_runtime_bs_hist = {}
         if hasattr(req, "spec_cycle_trace"):
             req.spec_cycle_trace = None
