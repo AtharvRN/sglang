@@ -479,12 +479,13 @@ class ServerArgs:
     speculative_dflash_adaptive_rho: float = 0.3
     speculative_dflash_adaptive_delta: float = 1.0
     speculative_dflash_adaptive_reward_mode: Literal[
-        "accept_length", "throughput"
+        "accept_length", "throughput", "throughput_proxy"
     ] = "accept_length"
     speculative_dflash_adaptive_ucb_c: float = 1.0
     speculative_dflash_adaptive_ucb_delta: float = 0.05
     speculative_dflash_adaptive_linucb_alpha: float = 1.0
     speculative_dflash_adaptive_linucb_lambda: float = 1.0
+    speculative_dflash_adaptive_proxy_cycle_ms: str = ""
     speculative_dflash_adaptive_k_min: Optional[int] = None
     speculative_dflash_adaptive_k_max: Optional[int] = None
     speculative_dflash_adaptive_k_start: Optional[int] = None
@@ -2518,13 +2519,22 @@ class ServerArgs:
                 reward_mode = (
                     str(self.speculative_dflash_adaptive_reward_mode).lower().strip()
                 )
-                if reward_mode not in ("accept_length", "throughput"):
+                if reward_mode not in (
+                    "accept_length",
+                    "throughput",
+                    "throughput_proxy",
+                ):
                     raise ValueError(
                         "DFLASH adaptive mode requires --speculative-dflash-adaptive-reward-mode "
-                        "to be one of {accept_length, throughput}. "
+                        "to be one of {accept_length, throughput, throughput_proxy}. "
                         f"Got {self.speculative_dflash_adaptive_reward_mode!r}."
                     )
                 self.speculative_dflash_adaptive_reward_mode = reward_mode
+                if self.speculative_dflash_adaptive_proxy_cycle_ms is None:
+                    self.speculative_dflash_adaptive_proxy_cycle_ms = ""
+                self.speculative_dflash_adaptive_proxy_cycle_ms = str(
+                    self.speculative_dflash_adaptive_proxy_cycle_ms
+                ).strip()
 
                 if adaptive_algo == "ewma":
                     if not (0.0 < float(self.speculative_dflash_adaptive_rho) <= 1.0):
@@ -4383,11 +4393,13 @@ class ServerArgs:
             "--speculative-dflash-adaptive-reward-mode",
             type=str,
             default=ServerArgs.speculative_dflash_adaptive_reward_mode,
-            choices=["accept_length", "throughput"],
+            choices=["accept_length", "throughput", "throughput_proxy"],
             help=(
                 "DFLASH adaptive reward mode. "
                 "accept_length uses accepted tokens per cycle; "
-                "throughput uses accepted tokens divided by attributed draft+verify cycle time."
+                "throughput uses accepted tokens divided by attributed draft+verify cycle time; "
+                "throughput_proxy uses accepted/proposed ratio proxy (accept_length/runtime_block_size), "
+                "which avoids runtime timing synchronization overhead."
             ),
         )
         parser.add_argument(
@@ -4413,6 +4425,16 @@ class ServerArgs:
             type=float,
             default=ServerArgs.speculative_dflash_adaptive_linucb_lambda,
             help="DFLASH adaptive LinUCB ridge regularization lambda (>0).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-proxy-cycle-ms",
+            type=str,
+            default=ServerArgs.speculative_dflash_adaptive_proxy_cycle_ms,
+            help=(
+                "Optional per-block estimated cycle-time map used by reward_mode=throughput_proxy. "
+                "Format: '8:1.85,12:2.05,16:2.25' (milliseconds per verify cycle). "
+                "If unset, throughput_proxy falls back to block-size units."
+            ),
         )
         parser.add_argument(
             "--speculative-dflash-adaptive-k-min",

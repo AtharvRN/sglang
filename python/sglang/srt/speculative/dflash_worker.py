@@ -165,6 +165,13 @@ class DFlashWorker:
         self._adaptive_reward_mode = str(
             server_args.speculative_dflash_adaptive_reward_mode
         ).lower()
+        self._adaptive_proxy_cycle_ms_raw = str(
+            getattr(server_args, "speculative_dflash_adaptive_proxy_cycle_ms", "")
+            or ""
+        ).strip()
+        self._adaptive_proxy_cycle_ms = self._parse_adaptive_proxy_cycle_ms(
+            self._adaptive_proxy_cycle_ms_raw
+        )
         self._adaptive_ucb_c = float(server_args.speculative_dflash_adaptive_ucb_c)
         self._adaptive_ucb_delta = float(
             server_args.speculative_dflash_adaptive_ucb_delta
@@ -253,6 +260,11 @@ class DFlashWorker:
                     logger.info(
                         "DFLASH adaptive block-size buckets enabled: %s",
                         self._adaptive_block_buckets,
+                    )
+                if self._adaptive_proxy_cycle_ms:
+                    logger.info(
+                        "DFLASH adaptive throughput-proxy cycle-ms map: %s",
+                        self._adaptive_proxy_cycle_ms,
                     )
             if self._report_cycle_trace:
                 logger.info("DFLASH per-cycle trace enabled.")
@@ -459,11 +471,44 @@ class DFlashWorker:
         ]
         return torch.tensor(context_vals, dtype=torch.float64, device="cpu")
 
+    def _parse_adaptive_proxy_cycle_ms(self, raw: str) -> dict[int, float]:
+        out: dict[int, float] = {}
+        if not raw:
+            return out
+        for token in str(raw).split(","):
+            item = token.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "Ignoring malformed throughput-proxy cycle-ms entry '%s'. "
+                        "Expected '<block_size>:<ms>'.",
+                        item,
+                    )
+                continue
+            k_str, v_str = item.split(":", 1)
+            try:
+                k = int(k_str.strip())
+                v = float(v_str.strip())
+                if k < 1 or v <= 0.0:
+                    raise ValueError()
+                out[k] = v
+            except Exception:
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "Ignoring invalid throughput-proxy cycle-ms entry '%s'. "
+                        "Expected positive integer block size and positive ms value.",
+                        item,
+                    )
+        return out
+
     def _compute_ucb_reward(
         self,
         *,
         req,
         accepted_draft_tokens: int,
+        runtime_block_size: int,
         draft_time_s: float,
         verify_time_s: float,
         num_active_reqs: int,
@@ -471,8 +516,20 @@ class DFlashWorker:
         # Include the target bonus token to match cycle-level accept length.
         accept_length = float(max(0, int(accepted_draft_tokens)) + 1)
 
-        if self._adaptive_reward_mode != "throughput":
+        if self._adaptive_reward_mode == "accept_length":
             return accept_length, "accept_length", accept_length
+        if self._adaptive_reward_mode == "throughput_proxy":
+            # Cost-aware proxy that avoids runtime timing sync:
+            # reward ~ accepted tokens per estimated cycle-ms for the current block size.
+            bs = int(max(int(runtime_block_size), 1))
+            est_ms = float(self._adaptive_proxy_cycle_ms.get(bs, float(bs)))
+            raw = accept_length / max(est_ms, 1e-6)
+            source = (
+                "throughput_proxy_est_cycle_ms"
+                if bs in self._adaptive_proxy_cycle_ms
+                else "throughput_proxy_fallback_bs_units"
+            )
+            return raw, source, raw
 
         if (
             not self._report_timing
@@ -686,6 +743,7 @@ class DFlashWorker:
             reward, reward_source, reward_raw = self._compute_ucb_reward(
                 req=req,
                 accepted_draft_tokens=accepted,
+                runtime_block_size=int(runtime_block_size),
                 draft_time_s=float(draft_time_s),
                 verify_time_s=float(verify_time_s),
                 num_active_reqs=int(num_active_reqs),
@@ -848,6 +906,7 @@ class DFlashWorker:
             reward, reward_source, reward_raw = self._compute_ucb_reward(
                 req=req,
                 accepted_draft_tokens=accepted,
+                runtime_block_size=int(runtime_block_size),
                 draft_time_s=float(draft_time_s),
                 verify_time_s=float(verify_time_s),
                 num_active_reqs=int(num_active_reqs),
