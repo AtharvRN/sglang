@@ -486,6 +486,11 @@ class ServerArgs:
     speculative_dflash_adaptive_linucb_alpha: float = 1.0
     speculative_dflash_adaptive_linucb_lambda: float = 1.0
     speculative_dflash_adaptive_proxy_cycle_ms: str = ""
+    speculative_dflash_adaptive_proxy_powerlaw_a: float = 0.0
+    speculative_dflash_adaptive_proxy_powerlaw_c_exp: float = 0.430
+    speculative_dflash_adaptive_proxy_powerlaw_k_exp: float = 0.160
+    speculative_dflash_adaptive_proxy_tau_exp: float = 1.0
+    speculative_dflash_adaptive_proxy_time_exp: float = 0.2
     speculative_dflash_adaptive_k_min: Optional[int] = None
     speculative_dflash_adaptive_k_max: Optional[int] = None
     speculative_dflash_adaptive_k_start: Optional[int] = None
@@ -2535,6 +2540,39 @@ class ServerArgs:
                 self.speculative_dflash_adaptive_proxy_cycle_ms = str(
                     self.speculative_dflash_adaptive_proxy_cycle_ms
                 ).strip()
+                self.speculative_dflash_adaptive_proxy_powerlaw_a = float(
+                    self.speculative_dflash_adaptive_proxy_powerlaw_a
+                )
+                self.speculative_dflash_adaptive_proxy_powerlaw_c_exp = float(
+                    self.speculative_dflash_adaptive_proxy_powerlaw_c_exp
+                )
+                self.speculative_dflash_adaptive_proxy_powerlaw_k_exp = float(
+                    self.speculative_dflash_adaptive_proxy_powerlaw_k_exp
+                )
+                self.speculative_dflash_adaptive_proxy_tau_exp = float(
+                    self.speculative_dflash_adaptive_proxy_tau_exp
+                )
+                self.speculative_dflash_adaptive_proxy_time_exp = float(
+                    self.speculative_dflash_adaptive_proxy_time_exp
+                )
+                if self.speculative_dflash_adaptive_proxy_powerlaw_a < 0.0:
+                    raise ValueError(
+                        "DFLASH adaptive throughput-proxy power-law requires "
+                        "--speculative-dflash-adaptive-proxy-powerlaw-a >= 0. "
+                        f"Got {self.speculative_dflash_adaptive_proxy_powerlaw_a}."
+                    )
+                if self.speculative_dflash_adaptive_proxy_tau_exp <= 0.0:
+                    raise ValueError(
+                        "DFLASH adaptive throughput-proxy requires "
+                        "--speculative-dflash-adaptive-proxy-tau-exp > 0. "
+                        f"Got {self.speculative_dflash_adaptive_proxy_tau_exp}."
+                    )
+                if self.speculative_dflash_adaptive_proxy_time_exp <= 0.0:
+                    raise ValueError(
+                        "DFLASH adaptive throughput-proxy requires "
+                        "--speculative-dflash-adaptive-proxy-time-exp > 0. "
+                        f"Got {self.speculative_dflash_adaptive_proxy_time_exp}."
+                    )
 
                 if adaptive_algo == "ewma":
                     if not (0.0 < float(self.speculative_dflash_adaptive_rho) <= 1.0):
@@ -4398,8 +4436,8 @@ class ServerArgs:
                 "DFLASH adaptive reward mode. "
                 "accept_length uses accepted tokens per cycle; "
                 "throughput uses accepted tokens divided by attributed draft+verify cycle time; "
-                "throughput_proxy uses accepted/proposed ratio proxy (accept_length/runtime_block_size), "
-                "which avoids runtime timing synchronization overhead."
+                "throughput_proxy uses tau/cycle-cost proxy from estimated cycle time maps or "
+                "power-law estimator, which avoids runtime timing synchronization overhead."
             ),
         )
         parser.add_argument(
@@ -4432,8 +4470,54 @@ class ServerArgs:
             default=ServerArgs.speculative_dflash_adaptive_proxy_cycle_ms,
             help=(
                 "Optional per-block estimated cycle-time map used by reward_mode=throughput_proxy. "
-                "Format: '8:1.85,12:2.05,16:2.25' (milliseconds per verify cycle). "
+                "Formats: '8:1.85,12:2.05,16:2.25' (k->ms) or "
+                "'1x8:7.5,4x8:3.2,16x8:1.9' ((c,k)->ms). "
                 "If unset, throughput_proxy falls back to block-size units."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-proxy-powerlaw-a",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_proxy_powerlaw_a,
+            help=(
+                "Optional power-law cycle-time estimator scale for reward_mode=throughput_proxy: "
+                "t_batch_ms = a * c^c_exp * k^k_exp. Disabled when a <= 0."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-proxy-powerlaw-c-exp",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_proxy_powerlaw_c_exp,
+            help=(
+                "Power-law cycle-time estimator concurrency exponent c_exp "
+                "for reward_mode=throughput_proxy."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-proxy-powerlaw-k-exp",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_proxy_powerlaw_k_exp,
+            help=(
+                "Power-law cycle-time estimator block-size exponent k_exp "
+                "for reward_mode=throughput_proxy."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-proxy-tau-exp",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_proxy_tau_exp,
+            help=(
+                "Reward numerator exponent for reward_mode=throughput_proxy. "
+                "Reward uses tau^tau_exp / est_cycle_ms^time_exp."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-adaptive-proxy-time-exp",
+            type=float,
+            default=ServerArgs.speculative_dflash_adaptive_proxy_time_exp,
+            help=(
+                "Reward denominator exponent for reward_mode=throughput_proxy. "
+                "Reward uses tau^tau_exp / est_cycle_ms^time_exp."
             ),
         )
         parser.add_argument(

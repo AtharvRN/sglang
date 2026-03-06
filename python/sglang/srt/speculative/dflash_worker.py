@@ -170,8 +170,45 @@ class DFlashWorker:
             getattr(server_args, "speculative_dflash_adaptive_proxy_cycle_ms", "")
             or ""
         ).strip()
-        self._adaptive_proxy_cycle_ms = self._parse_adaptive_proxy_cycle_ms(
-            self._adaptive_proxy_cycle_ms_raw
+        (
+            self._adaptive_proxy_cycle_ms_by_bs,
+            self._adaptive_proxy_cycle_ms_by_ck,
+        ) = self._parse_adaptive_proxy_cycle_ms(self._adaptive_proxy_cycle_ms_raw)
+        self._adaptive_proxy_powerlaw_a = float(
+            getattr(
+                server_args,
+                "speculative_dflash_adaptive_proxy_powerlaw_a",
+                0.0,
+            )
+            or 0.0
+        )
+        self._adaptive_proxy_powerlaw_c_exp = float(
+            getattr(
+                server_args,
+                "speculative_dflash_adaptive_proxy_powerlaw_c_exp",
+                0.430,
+            )
+        )
+        self._adaptive_proxy_powerlaw_k_exp = float(
+            getattr(
+                server_args,
+                "speculative_dflash_adaptive_proxy_powerlaw_k_exp",
+                0.160,
+            )
+        )
+        self._adaptive_proxy_tau_exp = float(
+            getattr(
+                server_args,
+                "speculative_dflash_adaptive_proxy_tau_exp",
+                1.0,
+            )
+        )
+        self._adaptive_proxy_time_exp = float(
+            getattr(
+                server_args,
+                "speculative_dflash_adaptive_proxy_time_exp",
+                1.0,
+            )
         )
         self._adaptive_ucb_c = float(server_args.speculative_dflash_adaptive_ucb_c)
         self._adaptive_ucb_delta = float(
@@ -262,10 +299,43 @@ class DFlashWorker:
                         "DFLASH adaptive block-size buckets enabled: %s",
                         self._adaptive_block_buckets,
                     )
-                if self._adaptive_proxy_cycle_ms:
+                if self._adaptive_proxy_cycle_ms_by_bs:
                     logger.info(
-                        "DFLASH adaptive throughput-proxy cycle-ms map: %s",
-                        self._adaptive_proxy_cycle_ms,
+                        "DFLASH adaptive throughput-proxy cycle-ms map (bs->ms): %s",
+                        self._adaptive_proxy_cycle_ms_by_bs,
+                    )
+                if self._adaptive_proxy_cycle_ms_by_ck:
+                    logger.info(
+                        "DFLASH adaptive throughput-proxy cycle-ms map ((c,k)->ms): %s",
+                        self._adaptive_proxy_cycle_ms_by_ck,
+                    )
+                if self._adaptive_proxy_powerlaw_a > 0.0:
+                    logger.info(
+                        "DFLASH adaptive throughput-proxy power-law enabled: "
+                        "a=%.6f c_exp=%.6f k_exp=%.6f",
+                        self._adaptive_proxy_powerlaw_a,
+                        self._adaptive_proxy_powerlaw_c_exp,
+                        self._adaptive_proxy_powerlaw_k_exp,
+                    )
+                if (
+                    abs(self._adaptive_proxy_tau_exp - 1.0) > 1e-12
+                    or abs(self._adaptive_proxy_time_exp - 1.0) > 1e-12
+                ):
+                    logger.info(
+                        "DFLASH adaptive throughput-proxy reward exponents: tau_exp=%.6f time_exp=%.6f",
+                        self._adaptive_proxy_tau_exp,
+                        self._adaptive_proxy_time_exp,
+                    )
+                if (
+                    not self._adaptive_proxy_cycle_ms_by_bs
+                    and not self._adaptive_proxy_cycle_ms_by_ck
+                    and self._adaptive_proxy_powerlaw_a <= 0.0
+                ):
+                    logger.warning(
+                        "DFLASH throughput_proxy has no cycle-time map and no power-law estimator. "
+                        "Falling back to tau/k proxy units (k=runtime block size). "
+                        "Provide --speculative-dflash-adaptive-proxy-cycle-ms or enable "
+                        "--speculative-dflash-adaptive-proxy-powerlaw-a for cost-aware rewards."
                     )
             if self._report_cycle_trace:
                 logger.info("DFLASH per-cycle trace enabled.")
@@ -505,10 +575,16 @@ class DFlashWorker:
         ]
         return torch.tensor(context_vals, dtype=torch.float64, device="cpu")
 
-    def _parse_adaptive_proxy_cycle_ms(self, raw: str) -> dict[int, float]:
-        out: dict[int, float] = {}
+    def _parse_adaptive_proxy_cycle_ms(
+        self, raw: str
+    ) -> tuple[dict[int, float], dict[tuple[int, int], float]]:
+        # Supports both:
+        # - '<k>:<ms>' (legacy)
+        # - '<c>x<k>:<ms>' (concurrency-specific)
+        out_by_bs: dict[int, float] = {}
+        out_by_ck: dict[tuple[int, int], float] = {}
         if not raw:
-            return out
+            return out_by_bs, out_by_ck
         for token in str(raw).split(","):
             item = token.strip()
             if not item:
@@ -523,19 +599,59 @@ class DFlashWorker:
                 continue
             k_str, v_str = item.split(":", 1)
             try:
-                k = int(k_str.strip())
+                key = k_str.strip().lower()
                 v = float(v_str.strip())
-                if k < 1 or v <= 0.0:
+                if v <= 0.0:
                     raise ValueError()
-                out[k] = v
+                if "x" in key:
+                    # concurrency-specific entry: '<c>x<k>:<ms>'
+                    c_raw, k_raw = key.split("x", 1)
+                    c = int(c_raw.strip())
+                    k = int(k_raw.strip())
+                    if c < 1 or k < 1:
+                        raise ValueError()
+                    out_by_ck[(c, k)] = v
+                else:
+                    k = int(key)
+                    if k < 1:
+                        raise ValueError()
+                    out_by_bs[k] = v
             except Exception:
                 if self.tp_rank == 0:
                     logger.warning(
                         "Ignoring invalid throughput-proxy cycle-ms entry '%s'. "
-                        "Expected positive integer block size and positive ms value.",
+                        "Expected '<k>:<ms>' or '<c>x<k>:<ms>' with positive values.",
                         item,
                     )
-        return out
+        return out_by_bs, out_by_ck
+
+    def _estimate_proxy_cycle_ms(
+        self, *, runtime_block_size: int, num_active_reqs: int
+    ) -> tuple[float, str]:
+        bs = int(max(int(runtime_block_size), 1))
+        c = int(max(int(num_active_reqs), 1))
+
+        if (c, bs) in self._adaptive_proxy_cycle_ms_by_ck:
+            return (
+                float(self._adaptive_proxy_cycle_ms_by_ck[(c, bs)]),
+                "throughput_proxy_ck_map",
+            )
+
+        if bs in self._adaptive_proxy_cycle_ms_by_bs:
+            return (
+                float(self._adaptive_proxy_cycle_ms_by_bs[bs]),
+                "throughput_proxy_bs_map",
+            )
+
+        if self._adaptive_proxy_powerlaw_a > 0.0:
+            est = (
+                float(self._adaptive_proxy_powerlaw_a)
+                * (float(c) ** float(self._adaptive_proxy_powerlaw_c_exp))
+                * (float(bs) ** float(self._adaptive_proxy_powerlaw_k_exp))
+            )
+            return (float(max(est, 1e-6)), "throughput_proxy_powerlaw")
+
+        return float(bs), "throughput_proxy_fallback_bs_units"
 
     def _compute_ucb_reward(
         self,
@@ -554,15 +670,14 @@ class DFlashWorker:
             return accept_length, "accept_length", accept_length
         if self._adaptive_reward_mode == "throughput_proxy":
             # Cost-aware proxy that avoids runtime timing sync:
-            # reward ~ accepted tokens per estimated cycle-ms for the current block size.
-            bs = int(max(int(runtime_block_size), 1))
-            est_ms = float(self._adaptive_proxy_cycle_ms.get(bs, float(bs)))
-            raw = accept_length / max(est_ms, 1e-6)
-            source = (
-                "throughput_proxy_est_cycle_ms"
-                if bs in self._adaptive_proxy_cycle_ms
-                else "throughput_proxy_fallback_bs_units"
+            # reward ~ tau^tau_exp / est_cycle_ms^time_exp.
+            est_ms, source = self._estimate_proxy_cycle_ms(
+                runtime_block_size=int(runtime_block_size),
+                num_active_reqs=int(num_active_reqs),
             )
+            tau_exp = float(max(self._adaptive_proxy_tau_exp, 1e-6))
+            time_exp = float(max(self._adaptive_proxy_time_exp, 1e-6))
+            raw = (accept_length ** tau_exp) / (max(est_ms, 1e-6) ** time_exp)
             return raw, source, raw
 
         if (
