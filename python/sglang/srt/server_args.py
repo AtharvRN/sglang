@@ -479,7 +479,11 @@ class ServerArgs:
     speculative_dflash_adaptive_rho: float = 0.3
     speculative_dflash_adaptive_delta: float = 1.0
     speculative_dflash_adaptive_reward_mode: Literal[
-        "accept_length", "throughput", "throughput_proxy"
+        "accept_length",
+        "throughput",
+        "throughput_cycle_e2e",
+        "throughput_cycle_rate",
+        "throughput_proxy",
     ] = "accept_length"
     speculative_dflash_adaptive_ucb_c: float = 1.0
     speculative_dflash_adaptive_ucb_delta: float = 0.05
@@ -2527,11 +2531,14 @@ class ServerArgs:
                 if reward_mode not in (
                     "accept_length",
                     "throughput",
+                    "throughput_cycle_e2e",
+                    "throughput_cycle_rate",
                     "throughput_proxy",
                 ):
                     raise ValueError(
                         "DFLASH adaptive mode requires --speculative-dflash-adaptive-reward-mode "
-                        "to be one of {accept_length, throughput, throughput_proxy}. "
+                        "to be one of {accept_length, throughput, throughput_cycle_e2e, "
+                        "throughput_cycle_rate, throughput_proxy}. "
                         f"Got {self.speculative_dflash_adaptive_reward_mode!r}."
                     )
                 self.speculative_dflash_adaptive_reward_mode = reward_mode
@@ -4431,11 +4438,20 @@ class ServerArgs:
             "--speculative-dflash-adaptive-reward-mode",
             type=str,
             default=ServerArgs.speculative_dflash_adaptive_reward_mode,
-            choices=["accept_length", "throughput", "throughput_proxy"],
+            choices=[
+                "accept_length",
+                "throughput",
+                "throughput_cycle_e2e",
+                "throughput_cycle_rate",
+                "throughput_proxy",
+            ],
             help=(
                 "DFLASH adaptive reward mode. "
                 "accept_length uses accepted tokens per cycle; "
                 "throughput uses accepted tokens divided by attributed draft+verify cycle time; "
+                "throughput_cycle_e2e uses accepted tokens divided by measured per-cycle end-to-end wall time; "
+                "throughput_cycle_rate uses UCB mean reward as ratio-of-sums "
+                "(sum accepted / sum e2e_cycle_time) per arm; "
                 "throughput_proxy uses tau/cycle-cost proxy from estimated cycle time maps or "
                 "power-law estimator, which avoids runtime timing synchronization overhead."
             ),

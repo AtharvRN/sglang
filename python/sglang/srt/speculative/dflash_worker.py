@@ -318,16 +318,8 @@ class DFlashWorker:
                         self._adaptive_proxy_powerlaw_k_exp,
                     )
                 if (
-                    abs(self._adaptive_proxy_tau_exp - 1.0) > 1e-12
-                    or abs(self._adaptive_proxy_time_exp - 1.0) > 1e-12
-                ):
-                    logger.info(
-                        "DFLASH adaptive throughput-proxy reward exponents: tau_exp=%.6f time_exp=%.6f",
-                        self._adaptive_proxy_tau_exp,
-                        self._adaptive_proxy_time_exp,
-                    )
-                if (
-                    not self._adaptive_proxy_cycle_ms_by_bs
+                    self._adaptive_reward_mode == "throughput_proxy"
+                    and not self._adaptive_proxy_cycle_ms_by_bs
                     and not self._adaptive_proxy_cycle_ms_by_ck
                     and self._adaptive_proxy_powerlaw_a <= 0.0
                 ):
@@ -336,6 +328,15 @@ class DFlashWorker:
                         "Falling back to tau/k proxy units (k=runtime block size). "
                         "Provide --speculative-dflash-adaptive-proxy-cycle-ms or enable "
                         "--speculative-dflash-adaptive-proxy-powerlaw-a for cost-aware rewards."
+                    )
+                if (
+                    abs(self._adaptive_proxy_tau_exp - 1.0) > 1e-12
+                    or abs(self._adaptive_proxy_time_exp - 1.0) > 1e-12
+                ):
+                    logger.info(
+                        "DFLASH adaptive throughput-proxy reward exponents: tau_exp=%.6f time_exp=%.6f",
+                        self._adaptive_proxy_tau_exp,
+                        self._adaptive_proxy_time_exp,
                     )
             if self._report_cycle_trace:
                 logger.info("DFLASH per-cycle trace enabled.")
@@ -433,30 +434,44 @@ class DFlashWorker:
             upper = lower
         return list(range(lower, upper + 1))
 
-    def _ensure_req_ucb_state(self, req) -> tuple[dict[int, int], dict[int, float]]:
+    def _ensure_req_ucb_state(
+        self, req
+    ) -> tuple[dict[int, int], dict[int, float], dict[int, float], dict[int, float]]:
         arms = self._adaptive_arms()
         counts = getattr(req, "dflash_adaptive_ucb_counts", None)
         reward_sums = getattr(req, "dflash_adaptive_ucb_reward_sums", None)
+        gain_sums = getattr(req, "dflash_adaptive_ucb_gain_sums", None)
+        cost_sums = getattr(req, "dflash_adaptive_ucb_cost_sums", None)
         if not isinstance(counts, dict):
             counts = {}
         if not isinstance(reward_sums, dict):
             reward_sums = {}
+        if not isinstance(gain_sums, dict):
+            gain_sums = {}
+        if not isinstance(cost_sums, dict):
+            cost_sums = {}
 
         # Keep state aligned with current arm space.
         normalized_counts: dict[int, int] = {}
         normalized_sums: dict[int, float] = {}
+        normalized_gain_sums: dict[int, float] = {}
+        normalized_cost_sums: dict[int, float] = {}
         for arm in arms:
             arm_i = int(arm)
             normalized_counts[arm_i] = int(counts.get(arm_i, 0) or 0)
             normalized_sums[arm_i] = float(reward_sums.get(arm_i, 0.0) or 0.0)
+            normalized_gain_sums[arm_i] = float(gain_sums.get(arm_i, 0.0) or 0.0)
+            normalized_cost_sums[arm_i] = float(cost_sums.get(arm_i, 0.0) or 0.0)
 
         req.dflash_adaptive_ucb_counts = normalized_counts
         req.dflash_adaptive_ucb_reward_sums = normalized_sums
+        req.dflash_adaptive_ucb_gain_sums = normalized_gain_sums
+        req.dflash_adaptive_ucb_cost_sums = normalized_cost_sums
         if getattr(req, "dflash_adaptive_ucb_rounds", None) is None:
             req.dflash_adaptive_ucb_rounds = 0
         if getattr(req, "dflash_adaptive_ucb_reward_norm_max", None) is None:
             req.dflash_adaptive_ucb_reward_norm_max = 1.0
-        return normalized_counts, normalized_sums
+        return normalized_counts, normalized_sums, normalized_gain_sums, normalized_cost_sums
 
     def _ensure_req_linucb_state(self, req):
         arms = self._adaptive_arms()
@@ -661,6 +676,7 @@ class DFlashWorker:
         runtime_block_size: int,
         draft_time_s: float,
         verify_time_s: float,
+        cycle_e2e_s: float,
         num_active_reqs: int,
     ) -> tuple[float, str, float]:
         # Include the target bonus token to match cycle-level accept length.
@@ -668,6 +684,24 @@ class DFlashWorker:
 
         if self._adaptive_reward_mode == "accept_length":
             return accept_length, "accept_length", accept_length
+        if self._adaptive_reward_mode == "throughput_cycle_e2e":
+            if cycle_e2e_s <= 0.0:
+                return (
+                    accept_length,
+                    "throughput_cycle_e2e_fallback_no_timing",
+                    accept_length,
+                )
+            raw = accept_length / max(float(cycle_e2e_s), 1e-6)
+            return raw, "throughput_cycle_e2e", raw
+        if self._adaptive_reward_mode == "throughput_cycle_rate":
+            if cycle_e2e_s <= 0.0:
+                return (
+                    accept_length,
+                    "throughput_cycle_rate_fallback_no_timing",
+                    accept_length,
+                )
+            raw = accept_length / max(float(cycle_e2e_s), 1e-6)
+            return raw, "throughput_cycle_rate", raw
         if self._adaptive_reward_mode == "throughput_proxy":
             # Cost-aware proxy that avoids runtime timing sync:
             # reward ~ tau^tau_exp / est_cycle_ms^time_exp.
@@ -773,7 +807,7 @@ class DFlashWorker:
 
         Modes:
         - Adaptive mode ON: use per-request adaptive state and choose an effective
-          batch block size as the minimum desired block size among active requests.
+          batch block size as the maximum desired block size among active requests.
         - Adaptive mode OFF: fallback to optional request custom param
           (`sampling_params.custom_params['dflash_block_size']`) with min-on-mixed policy.
         """
@@ -787,7 +821,9 @@ class DFlashWorker:
             if len(desired) == 0:
                 return max_block_size
 
-            effective_block_size = int(min(desired))
+            # Use the largest requested runtime block size for the batch.
+            # This favors higher speculative length when requests disagree.
+            effective_block_size = int(max(desired))
 
             if (
                 len(set(desired)) > 1
@@ -796,7 +832,7 @@ class DFlashWorker:
             ):
                 logger.info(
                     "DFLASH adaptive per-request desired block sizes are mixed (%s); "
-                    "using min=%d for this step.",
+                    "using max=%d for this step.",
                     sorted(set(desired)),
                     effective_block_size,
                 )
@@ -866,6 +902,7 @@ class DFlashWorker:
         runtime_block_size: int,
         draft_time_s: float = 0.0,
         verify_time_s: float = 0.0,
+        cycle_e2e_s: float = 0.0,
         num_active_reqs: int = 1,
     ) -> None:
         if not self._adaptive_block_size_enabled:
@@ -881,7 +918,7 @@ class DFlashWorker:
         )
 
         if self._adaptive_algo == "ucb":
-            counts, reward_sums = self._ensure_req_ucb_state(req)
+            counts, reward_sums, gain_sums, cost_sums = self._ensure_req_ucb_state(req)
             arms = sorted(int(a) for a in counts.keys())
 
             pulled_arm = int(runtime_block_size)
@@ -902,11 +939,19 @@ class DFlashWorker:
                 runtime_block_size=int(runtime_block_size),
                 draft_time_s=float(draft_time_s),
                 verify_time_s=float(verify_time_s),
+                cycle_e2e_s=float(cycle_e2e_s),
                 num_active_reqs=int(num_active_reqs),
             )
 
+            # Rate objective for throughput optimization: mean_k = sum(gain)/sum(cost),
+            # where gain is accepted length and cost is measured end-to-end cycle time.
+            gain = float(max(0, int(accepted_draft_tokens)) + 1)
+            cost = float(max(float(cycle_e2e_s), 1e-6))
+
             counts[pulled_arm] = int(counts[pulled_arm]) + 1
             reward_sums[pulled_arm] = float(reward_sums[pulled_arm]) + float(reward)
+            gain_sums[pulled_arm] = float(gain_sums[pulled_arm]) + float(gain)
+            cost_sums[pulled_arm] = float(cost_sums[pulled_arm]) + float(cost)
             rounds = int(getattr(req, "dflash_adaptive_ucb_rounds", 0) or 0) + 1
             req.dflash_adaptive_ucb_rounds = int(rounds)
 
@@ -935,6 +980,18 @@ class DFlashWorker:
                         bonus = (l_bound / 2.0) * math.sqrt(
                             ((1.0 + n) / (n * n)) * max(inner, 0.0)
                         )
+                        means[arm] = float(mean)
+                        bonuses[arm] = float(bonus)
+                        scores[arm] = float(mean + bonus)
+                elif self._adaptive_reward_mode == "throughput_cycle_rate":
+                    c = max(float(self._adaptive_ucb_c), 0.0)
+                    log_t = math.log(max(float(rounds), 2.0))
+                    for arm in arms:
+                        n = float(max(int(counts.get(arm, 0)), 1))
+                        arm_cost = float(max(float(cost_sums.get(arm, 0.0)), 1e-6))
+                        arm_gain = float(gain_sums.get(arm, 0.0))
+                        mean = arm_gain / arm_cost
+                        bonus = c * math.sqrt((2.0 * log_t) / n)
                         means[arm] = float(mean)
                         bonuses[arm] = float(bonus)
                         scores[arm] = float(mean + bonus)
@@ -1005,6 +1062,12 @@ class DFlashWorker:
                     float(reward_sums.get(pulled_arm, 0.0))
                     / float(max(int(counts.get(pulled_arm, 0)), 1))
                 ),
+                "ucb_pulled_arm_gain_sum": float(gain_sums.get(pulled_arm, 0.0)),
+                "ucb_pulled_arm_cost_sum_s": float(cost_sums.get(pulled_arm, 0.0)),
+                "ucb_pulled_arm_rate": float(
+                    float(gain_sums.get(pulled_arm, 0.0))
+                    / float(max(float(cost_sums.get(pulled_arm, 0.0)), 1e-6))
+                ),
                 "ucb_selected_mean_reward": (
                     float(means[next_bs]) if next_bs in means else None
                 ),
@@ -1065,6 +1128,7 @@ class DFlashWorker:
                 runtime_block_size=int(runtime_block_size),
                 draft_time_s=float(draft_time_s),
                 verify_time_s=float(verify_time_s),
+                cycle_e2e_s=float(cycle_e2e_s),
                 num_active_reqs=int(num_active_reqs),
             )
 
@@ -1204,6 +1268,7 @@ class DFlashWorker:
                 runtime_block_size=int(runtime_block_size),
                 draft_time_s=float(draft_time_s),
                 verify_time_s=float(verify_time_s),
+                cycle_e2e_s=float(cycle_e2e_s),
                 num_active_reqs=int(num_active_reqs),
             )
 
@@ -1478,6 +1543,7 @@ class DFlashWorker:
         accept_length_per_req_cpu: list[int],
         runtime_block_size: int,
         verify_time_s: float,
+        cycle_e2e_s: float,
     ) -> None:
         if not self._report_cycle_trace:
             return
@@ -1493,6 +1559,11 @@ class DFlashWorker:
         per_req_verify_time_s = (
             float(verify_time_s) / float(len(batch.reqs))
             if self._report_timing and verify_time_s > 0.0
+            else None
+        )
+        per_req_cycle_e2e_s = (
+            float(cycle_e2e_s) / float(len(batch.reqs))
+            if cycle_e2e_s > 0.0 and len(batch.reqs) > 0
             else None
         )
 
@@ -1521,6 +1592,10 @@ class DFlashWorker:
                     "accept_rate": accept_rate,
                     "draft_time_s": per_req_draft_time_s,
                     "verify_time_s": per_req_verify_time_s,
+                    "cycle_e2e_batch_s": (
+                        float(cycle_e2e_s) if cycle_e2e_s > 0.0 else None
+                    ),
+                    "cycle_e2e_s": per_req_cycle_e2e_s,
                     "adaptive_decision": adaptive_decision,
                 }
             )
@@ -1656,6 +1731,8 @@ class DFlashWorker:
             req.dflash_adaptive_last_decision = None
             req.dflash_adaptive_ucb_counts = {}
             req.dflash_adaptive_ucb_reward_sums = {}
+            req.dflash_adaptive_ucb_gain_sums = {}
+            req.dflash_adaptive_ucb_cost_sums = {}
             req.dflash_adaptive_ucb_rounds = 0
             req.dflash_adaptive_ucb_reward_norm_max = 1.0
             req.dflash_adaptive_ucb_last_scores = None
@@ -2409,6 +2486,7 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        cycle_start_t = time.perf_counter()
         self._prepare_for_speculative_decoding(batch, draft_input)
         if self._report_timing and self.tp_rank == 0:
             self._accumulate_req_shared_time(
@@ -2451,6 +2529,11 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        cycle_e2e_s = max(time.perf_counter() - cycle_start_t, 0.0)
+        if self.tp_rank == 0:
+            self._accumulate_req_shared_time(
+                batch.reqs, "spec_cycle_e2e_s", float(cycle_e2e_s)
+            )
         runtime_bs = int(getattr(self, "_last_runtime_block_size", self.block_size))
         if self._adaptive_block_size_enabled:
             for req, accepted_draft_tokens in self._iter_req_value_pairs(
@@ -2462,6 +2545,7 @@ class DFlashWorker:
                     runtime_block_size=runtime_bs,
                     draft_time_s=float(self._last_draft_time_s),
                     verify_time_s=float(verify_time_s),
+                    cycle_e2e_s=float(cycle_e2e_s),
                     num_active_reqs=len(batch.reqs),
                 )
         self._record_cycle_trace(
@@ -2469,6 +2553,7 @@ class DFlashWorker:
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             runtime_block_size=runtime_bs,
             verify_time_s=float(verify_time_s),
+            cycle_e2e_s=float(cycle_e2e_s),
         )
 
         if need_mamba_verify_commit:
