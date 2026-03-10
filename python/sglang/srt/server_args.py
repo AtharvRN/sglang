@@ -504,7 +504,28 @@ class ServerArgs:
     speculative_dflash_adaptive_high_accept_threshold: float = 0.90
     speculative_dflash_adaptive_high_accept_streak: int = 2
     speculative_dflash_adaptive_cooldown_cycles: int = 1
+    speculative_dflash_confidence_gate: bool = False
+    speculative_dflash_confidence_gate_mode: Literal["threshold", "score"] = "threshold"
+    speculative_dflash_confidence_threshold: float = 0.20
+    speculative_dflash_confidence_gate_score_metric: Literal[
+        "neg_log_max_prob", "entropy"
+    ] = (
+        "neg_log_max_prob"
+    )
+    speculative_dflash_confidence_gate_score_budget: float = 1.5
+    speculative_dflash_confidence_gate_aggregate: Literal[
+        "min", "q10", "q25", "q50", "median", "mean", "q75", "q90", "max"
+    ] = "q10"
+    speculative_dflash_confidence_gate_min_verify_tokens: int = 1
+    speculative_dflash_confidence_gate_mab: bool = False
+    speculative_dflash_confidence_gate_mab_algo: Literal["ucb", "thompson"] = "ucb"
+    speculative_dflash_confidence_gate_mab_ucb_c: float = 1.0
+    speculative_dflash_confidence_gate_mab_arms: Optional[List[float]] = None
+    speculative_dflash_confidence_gate_grouped_verify: bool = False
+    speculative_dflash_confidence_gate_grouped_verify_buckets: Optional[List[int]] = None
     speculative_dflash_cycle_trace: bool = False
+    speculative_dflash_predictor_dataset_output_dir: Optional[str] = None
+    speculative_dflash_predictor_dataset_shard_rows: int = 100000
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2747,6 +2768,213 @@ class ServerArgs:
                         f"Got {self.speculative_dflash_adaptive_cooldown_cycles}."
                     )
 
+            self.speculative_dflash_confidence_gate = bool(
+                self.speculative_dflash_confidence_gate
+            )
+            self.speculative_dflash_confidence_gate_mab = bool(
+                self.speculative_dflash_confidence_gate_mab
+            )
+            self.speculative_dflash_confidence_gate_grouped_verify = bool(
+                self.speculative_dflash_confidence_gate_grouped_verify
+            )
+            if self.speculative_dflash_confidence_gate_mab:
+                self.speculative_dflash_confidence_gate = True
+            if self.speculative_dflash_confidence_gate_grouped_verify:
+                self.speculative_dflash_confidence_gate = True
+            if self.speculative_dflash_confidence_gate:
+                conf_mode = str(
+                    self.speculative_dflash_confidence_gate_mode
+                ).lower().strip()
+                if conf_mode not in ("threshold", "score"):
+                    raise ValueError(
+                        "DFLASH confidence gate mode must be one of {threshold, score}. "
+                        f"Got {self.speculative_dflash_confidence_gate_mode!r}."
+                    )
+                self.speculative_dflash_confidence_gate_mode = conf_mode
+
+                if conf_mode == "threshold" or self.speculative_dflash_confidence_gate_mab:
+                    conf_threshold = float(self.speculative_dflash_confidence_threshold)
+                    if not (0.0 < conf_threshold < 1.0):
+                        raise ValueError(
+                            "DFLASH confidence gate threshold requires "
+                            "--speculative-dflash-confidence-threshold in (0,1). "
+                            f"Got {self.speculative_dflash_confidence_threshold}."
+                        )
+                    self.speculative_dflash_confidence_threshold = conf_threshold
+                else:
+                    self.speculative_dflash_confidence_threshold = float(
+                        self.speculative_dflash_confidence_threshold
+                    )
+
+                score_metric = str(
+                    self.speculative_dflash_confidence_gate_score_metric
+                ).lower().strip()
+                if score_metric not in ("neg_log_max_prob", "entropy"):
+                    raise ValueError(
+                        "DFLASH confidence gate score metric must be one of "
+                        "{neg_log_max_prob, entropy}. "
+                        f"Got {self.speculative_dflash_confidence_gate_score_metric!r}."
+                    )
+                self.speculative_dflash_confidence_gate_score_metric = score_metric
+
+                score_budget = float(
+                    self.speculative_dflash_confidence_gate_score_budget
+                )
+                if score_budget <= 0.0:
+                    raise ValueError(
+                        "DFLASH confidence gate score budget must be > 0. "
+                        f"Got {self.speculative_dflash_confidence_gate_score_budget}."
+                    )
+                self.speculative_dflash_confidence_gate_score_budget = score_budget
+
+                conf_agg = str(
+                    self.speculative_dflash_confidence_gate_aggregate
+                ).lower().strip()
+                if conf_agg not in (
+                    "min",
+                    "q10",
+                    "q25",
+                    "q50",
+                    "median",
+                    "mean",
+                    "q75",
+                    "q90",
+                    "max",
+                ):
+                    raise ValueError(
+                        "DFLASH confidence gate aggregate must be one of "
+                        "{min,q10,q25,q50,median,mean,q75,q90,max}. "
+                        f"Got {self.speculative_dflash_confidence_gate_aggregate!r}."
+                    )
+                self.speculative_dflash_confidence_gate_aggregate = conf_agg
+
+                min_verify_tokens = int(
+                    self.speculative_dflash_confidence_gate_min_verify_tokens
+                )
+                if min_verify_tokens < 1:
+                    raise ValueError(
+                        "DFLASH confidence gate min verify tokens must be >= 1. "
+                        f"Got {self.speculative_dflash_confidence_gate_min_verify_tokens}."
+                    )
+                if min_verify_tokens > int(self.speculative_num_draft_tokens):
+                    raise ValueError(
+                        "DFLASH confidence gate min verify tokens cannot exceed configured block size "
+                        f"(speculative_num_draft_tokens={self.speculative_num_draft_tokens}). "
+                        f"Got {min_verify_tokens}."
+                    )
+                self.speculative_dflash_confidence_gate_min_verify_tokens = (
+                    min_verify_tokens
+                )
+
+                if self.speculative_dflash_confidence_gate_mab:
+                    if self.speculative_dflash_confidence_gate_mode != "threshold":
+                        raise ValueError(
+                            "DFLASH confidence-gate MAB currently only supports "
+                            "--speculative-dflash-confidence-gate-mode threshold."
+                        )
+                    mab_algo = str(
+                        self.speculative_dflash_confidence_gate_mab_algo
+                    ).lower().strip()
+                    if mab_algo not in ("ucb", "thompson"):
+                        raise ValueError(
+                            "DFLASH confidence-gate MAB algo must be one of {ucb, thompson}. "
+                            f"Got {self.speculative_dflash_confidence_gate_mab_algo!r}."
+                        )
+                    self.speculative_dflash_confidence_gate_mab_algo = mab_algo
+
+                    mab_ucb_c = float(self.speculative_dflash_confidence_gate_mab_ucb_c)
+                    if mab_ucb_c < 0.0:
+                        raise ValueError(
+                            "DFLASH confidence-gate MAB requires --speculative-dflash-confidence-gate-mab-ucb-c >= 0. "
+                            f"Got {self.speculative_dflash_confidence_gate_mab_ucb_c}."
+                        )
+                    self.speculative_dflash_confidence_gate_mab_ucb_c = mab_ucb_c
+
+                    raw_arms = self.speculative_dflash_confidence_gate_mab_arms
+                    if raw_arms:
+                        try:
+                            arms = sorted({float(v) for v in raw_arms})
+                        except Exception as e:
+                            raise ValueError(
+                                "DFLASH confidence-gate MAB arms must be a list of floats in (0,1). "
+                                f"Got {raw_arms!r}."
+                            ) from e
+                    else:
+                        center = float(self.speculative_dflash_confidence_threshold)
+                        arms = sorted(
+                            {
+                                max(0.01, min(0.99, center - 0.10)),
+                                max(0.01, min(0.99, center)),
+                                max(0.01, min(0.99, center + 0.10)),
+                            }
+                        )
+                    if len(arms) == 0:
+                        raise ValueError(
+                            "DFLASH confidence-gate MAB arms cannot be empty."
+                        )
+                    for arm in arms:
+                        if not (0.0 < float(arm) < 1.0):
+                            raise ValueError(
+                                "DFLASH confidence-gate MAB arms must be in (0,1). "
+                                f"Got arm={arm}."
+                            )
+                    self.speculative_dflash_confidence_gate_mab_arms = arms
+                else:
+                    self.speculative_dflash_confidence_gate_mab_arms = None
+
+                if self.speculative_dflash_confidence_gate_grouped_verify:
+                    raw_group_buckets = (
+                        self.speculative_dflash_confidence_gate_grouped_verify_buckets
+                    )
+                    if raw_group_buckets:
+                        try:
+                            group_buckets = sorted({int(v) for v in raw_group_buckets})
+                        except Exception as e:
+                            raise ValueError(
+                                "DFLASH confidence-gate grouped verify buckets must be a list of ints in [1, block_size]. "
+                                f"Got {raw_group_buckets!r}."
+                            ) from e
+                        if len(group_buckets) == 0:
+                            raise ValueError(
+                                "DFLASH confidence-gate grouped verify buckets cannot be empty."
+                            )
+                        for b in group_buckets:
+                            if b < 1 or b > int(self.speculative_num_draft_tokens):
+                                raise ValueError(
+                                    "DFLASH confidence-gate grouped verify bucket must be in [1, block_size]. "
+                                    f"Got bucket={b}, block_size={self.speculative_num_draft_tokens}."
+                                )
+                        self.speculative_dflash_confidence_gate_grouped_verify_buckets = (
+                            group_buckets
+                        )
+                    else:
+                        self.speculative_dflash_confidence_gate_grouped_verify_buckets = (
+                            None
+                        )
+                else:
+                    self.speculative_dflash_confidence_gate_grouped_verify_buckets = (
+                        None
+                    )
+
+                if self.speculative_dflash_predictor_dataset_output_dir is not None:
+                    output_dir = str(
+                        self.speculative_dflash_predictor_dataset_output_dir
+                    ).strip()
+                    if not output_dir:
+                        raise ValueError(
+                            "DFLASH predictor dataset output dir must be a non-empty path."
+                        )
+                    self.speculative_dflash_predictor_dataset_output_dir = output_dir
+                    shard_rows = int(
+                        self.speculative_dflash_predictor_dataset_shard_rows
+                    )
+                    if shard_rows <= 0:
+                        raise ValueError(
+                            "DFLASH predictor dataset shard rows must be > 0. "
+                            f"Got {self.speculative_dflash_predictor_dataset_shard_rows}."
+                        )
+                    self.speculative_dflash_predictor_dataset_shard_rows = shard_rows
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
@@ -4599,6 +4827,118 @@ class ServerArgs:
             help="DFLASH adaptive hold cycles after a block-size change to reduce oscillation.",
         )
         parser.add_argument(
+            "--speculative-dflash-confidence-gate",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_confidence_gate,
+            help=(
+                "DFLASH only. Enable confidence-gated verify length: draft full block, "
+                "then verify a confidence-selected prefix."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-mode",
+            type=str,
+            default=ServerArgs.speculative_dflash_confidence_gate_mode,
+            choices=["threshold", "score"],
+            help=(
+                "DFLASH confidence-gate mode. "
+                "'threshold' verifies until the first low-confidence token. "
+                "'score' verifies the longest prefix whose cumulative score stays within a budget."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-threshold",
+            type=float,
+            default=ServerArgs.speculative_dflash_confidence_threshold,
+            help=(
+                "DFLASH confidence-gate threshold in (0,1). "
+                "For each request, verify up to the first drafted token whose max-prob is below this threshold."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-score-metric",
+            type=str,
+            default=ServerArgs.speculative_dflash_confidence_gate_score_metric,
+            choices=["neg_log_max_prob", "entropy"],
+            help=(
+                "Per-token score used by score-based confidence gating. "
+                "'neg_log_max_prob' uses -log(max draft probability) per drafted token. "
+                "'entropy' uses the draft-token predictive entropy per drafted token."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-score-budget",
+            type=float,
+            default=ServerArgs.speculative_dflash_confidence_gate_score_budget,
+            help=(
+                "Cumulative score budget for score-based confidence gating. "
+                "Verify the longest drafted prefix whose cumulative score stays <= this budget."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-aggregate",
+            type=str,
+            default=ServerArgs.speculative_dflash_confidence_gate_aggregate,
+            choices=["min", "q10", "q25", "q50", "median", "mean", "q75", "q90", "max"],
+            help=(
+                "How per-request confidence-gated verify lengths are aggregated to one batch verify length."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-min-verify-tokens",
+            type=int,
+            default=ServerArgs.speculative_dflash_confidence_gate_min_verify_tokens,
+            help="DFLASH confidence gate minimum verify length per cycle (>=1).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-mab",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_confidence_gate_mab,
+            help="Enable MAB selection of confidence threshold arms.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-mab-algo",
+            type=str,
+            default=ServerArgs.speculative_dflash_confidence_gate_mab_algo,
+            choices=["ucb", "thompson"],
+            help="DFLASH confidence-gate MAB algorithm.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-mab-ucb-c",
+            type=float,
+            default=ServerArgs.speculative_dflash_confidence_gate_mab_ucb_c,
+            help="DFLASH confidence-gate MAB UCB exploration coefficient.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-mab-arms",
+            type=float,
+            nargs="+",
+            default=ServerArgs.speculative_dflash_confidence_gate_mab_arms,
+            help=(
+                "Optional confidence threshold arms for MAB (e.g., 0.15 0.20 0.25). "
+                "If unset, defaults are generated around --speculative-dflash-confidence-threshold."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-grouped-verify",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_confidence_gate_grouped_verify,
+            help=(
+                "Enable grouped variable-length target verification for confidence gating. "
+                "Requests with different verify lengths are verified in per-length groups within a cycle."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-grouped-verify-buckets",
+            type=int,
+            nargs="+",
+            default=ServerArgs.speculative_dflash_confidence_gate_grouped_verify_buckets,
+            help=(
+                "Optional verify-length buckets for grouped confidence-gate verification "
+                "(e.g., 4 8 12 16). If unset, exact per-request verify lengths are grouped."
+            ),
+        )
+        parser.add_argument(
             "--speculative-dflash-cycle-trace",
             action="store_true",
             default=ServerArgs.speculative_dflash_cycle_trace,
@@ -4606,6 +4946,21 @@ class ServerArgs:
                 "DFLASH only. Emit per-request per-cycle trace in response meta_info "
                 "(accept length, runtime block size, and attributed draft/verify timings)."
             ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-predictor-dataset-output-dir",
+            type=str,
+            default=ServerArgs.speculative_dflash_predictor_dataset_output_dir,
+            help=(
+                "DFLASH only. Write per-cycle draft hidden features and acceptance "
+                "labels as binary predictor-training shards under this directory."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-predictor-dataset-shard-rows",
+            type=int,
+            default=ServerArgs.speculative_dflash_predictor_dataset_shard_rows,
+            help="DFLASH predictor dataset rows per binary shard.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
