@@ -23,6 +23,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import torch
@@ -475,6 +476,7 @@ class CudaGraphRunner:
         self.capture_num_tokens_per_bs: List[int] = [1]
         self._buffer_num_tokens_per_bs = 1
         self._dflash_flashinfer_bucketed_replay_enabled = False
+        self._cuda_graph_state_inited_attn_backends: set[int] = set()
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
@@ -681,9 +683,7 @@ class CudaGraphRunner:
             self.max_bs * num_tokens_per_bs
             for num_tokens_per_bs in self.capture_num_tokens_per_bs
         )
-        self.model_runner.attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
+        self._ensure_attn_backend_cuda_graph_state(self.model_runner.attn_backend)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -764,7 +764,16 @@ class CudaGraphRunner:
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+                self._ensure_attn_backend_cuda_graph_state(attn_backend)
+
+    def _ensure_attn_backend_cuda_graph_state(self, attn_backend):
+        if attn_backend is None:
+            return
+        backend_id = id(attn_backend)
+        if backend_id in self._cuda_graph_state_inited_attn_backends:
+            return
+        attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self._cuda_graph_state_inited_attn_backends.add(backend_id)
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -1108,6 +1117,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             stream_idx=stream_idx,
         )
+        self._ensure_attn_backend_cuda_graph_state(attn_backend)
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -1315,11 +1325,12 @@ class CudaGraphRunner:
                     buffers.custom_mask[:mask_numel].copy_(runtime_custom_mask)
                 forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.model_runner.attn_backend
+        attn_backend = self.model_runner.get_attention_backend_for_forward(
+            self.capture_forward_mode,
+            spec_info=forward_batch.spec_info,
+            stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
+        )
+        self._ensure_attn_backend_cuda_graph_state(attn_backend)
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1495,8 +1506,12 @@ class CudaGraphRunner:
 
             # Avoid enabling custom-mask modes during graph capture for backends that
             # can express DFLASH verify via their built-in causal path.
+            capture_attn_backend = self.model_runner.get_attention_backend_for_forward(
+                self.capture_forward_mode,
+                spec_info=SimpleNamespace(num_candidates=num_candidates),
+            )
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
-                self.model_runner.attn_backend,
+                capture_attn_backend,
                 num_candidates=num_candidates,
             )
             spec_info = DFlashVerifyInput(
