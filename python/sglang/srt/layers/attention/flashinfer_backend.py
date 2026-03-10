@@ -296,9 +296,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
-        # Keyed by (capture_bs, forward_mode_name, draft_token_bucket).
-        # draft_token_bucket matters for speculative prefill modes where the
-        # runtime draft length changes across steps.
+        # Keyed by (capture_bs, forward_mode_name, verify_token_bucket).
+        # verify_token_bucket is usually tokens_per_req (if present), and
+        # falls back to draft_token_num for legacy speculative modes.
         self.prefill_cuda_graph_metadata = {}  # For verify/draft extend
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
@@ -311,16 +311,22 @@ class FlashInferAttnBackend(AttentionBackend):
     ) -> tuple[int, str, int]:
         draft_token_bucket = 0
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend():
-            runtime_draft_token_num = (
-                getattr(spec_info, "draft_token_num", None)
+            runtime_token_bucket = (
+                getattr(spec_info, "tokens_per_req", None)
                 if spec_info is not None
                 else None
             )
-            if runtime_draft_token_num is None and num_tokens is not None:
-                runtime_draft_token_num = int(num_tokens)
-            if runtime_draft_token_num is None:
-                runtime_draft_token_num = 1
-            draft_token_bucket = int(runtime_draft_token_num)
+            if runtime_token_bucket is None:
+                runtime_token_bucket = (
+                    getattr(spec_info, "draft_token_num", None)
+                    if spec_info is not None
+                    else None
+                )
+            if runtime_token_bucket is None and num_tokens is not None:
+                runtime_token_bucket = int(num_tokens)
+            if runtime_token_bucket is None:
+                runtime_token_bucket = 1
+            draft_token_bucket = int(runtime_token_bucket)
         return (int(bs), forward_mode.name, draft_token_bucket)
 
     def _process_multi_item_scoring(

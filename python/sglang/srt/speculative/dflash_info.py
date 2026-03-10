@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -22,6 +22,13 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+_DFLASH_VERIFY_MASK_TEMPLATE_CACHE: Dict[
+    Tuple[str, int, int, int], torch.Tensor
+] = {}
+_DFLASH_COMPACT_PATH_INDEX_CACHE: Dict[
+    Tuple[str, int, int, int], torch.Tensor
+] = {}
 
 
 def _compute_paged_keep_slots(
@@ -50,12 +57,101 @@ def _compute_paged_keep_slots(
     return keep_slots
 
 
+def _get_dflash_verify_suffix_template(
+    *,
+    num_candidates: int,
+    candidate_block_size: int,
+    shared_prefix_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a cached per-request [q_len, q_len] branch-isolation mask template."""
+    num_candidates_i = int(max(1, num_candidates))
+    block_len = int(candidate_block_size)
+    shared_len = int(max(0, min(shared_prefix_len, block_len)))
+    cache_key = (str(device), num_candidates_i, block_len, shared_len)
+    cached = _DFLASH_VERIFY_MASK_TEMPLATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    compact_tree = bool(num_candidates_i > 1 and 0 < shared_len < block_len)
+    if compact_tree:
+        suffix_len = block_len - shared_len
+        q_len = shared_len + num_candidates_i * suffix_len
+        template = torch.zeros((q_len, q_len), dtype=torch.bool, device=device)
+        if shared_len > 0:
+            template[:shared_len, :shared_len] = torch.tril(
+                torch.ones((shared_len, shared_len), dtype=torch.bool, device=device)
+            )
+            template[shared_len:, :shared_len] = True
+        suffix_tril = torch.tril(
+            torch.ones((suffix_len, suffix_len), dtype=torch.bool, device=device)
+        )
+        for cand_idx in range(num_candidates_i):
+            base = shared_len + cand_idx * suffix_len
+            template[base : base + suffix_len, base : base + suffix_len] = suffix_tril
+    elif num_candidates_i <= 1:
+        q_len = block_len
+        q_idx = torch.arange(q_len, device=device, dtype=torch.int32).unsqueeze(1)
+        k_idx = torch.arange(q_len, device=device, dtype=torch.int32).unsqueeze(0)
+        template = k_idx <= q_idx
+    else:
+        q_len = block_len * num_candidates_i
+        template = torch.zeros((q_len, q_len), dtype=torch.bool, device=device)
+        block_tril = torch.tril(
+            torch.ones((block_len, block_len), dtype=torch.bool, device=device)
+        )
+        for cand_idx in range(num_candidates_i):
+            base = cand_idx * block_len
+            template[base : base + block_len, base : base + block_len] = block_tril
+
+    _DFLASH_VERIFY_MASK_TEMPLATE_CACHE[cache_key] = template
+    return template
+
+
+def _get_compact_candidate_path_indices(
+    *,
+    num_candidates: int,
+    candidate_block_size: int,
+    shared_prefix_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return [num_candidates, block_size] token indices for compact-tree chosen paths."""
+    num_candidates_i = int(max(1, num_candidates))
+    block_len = int(candidate_block_size)
+    shared_len = int(max(0, min(shared_prefix_len, block_len)))
+    cache_key = (str(device), num_candidates_i, block_len, shared_len)
+    cached = _DFLASH_COMPACT_PATH_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not (num_candidates_i > 1 and 0 < shared_len < block_len):
+        path = torch.arange(
+            block_len,
+            dtype=torch.int64,
+            device=device,
+        ).unsqueeze(0)
+        _DFLASH_COMPACT_PATH_INDEX_CACHE[cache_key] = path
+        return path
+
+    suffix_len = block_len - shared_len
+    shared_idx = torch.arange(shared_len, dtype=torch.int64, device=device)
+    suffix_arange = torch.arange(suffix_len, dtype=torch.int64, device=device)
+    rows: List[torch.Tensor] = []
+    for cand_idx in range(num_candidates_i):
+        suffix_idx = shared_len + cand_idx * suffix_len + suffix_arange
+        rows.append(torch.cat([shared_idx, suffix_idx], dim=0))
+    table = torch.stack(rows, dim=0)
+    _DFLASH_COMPACT_PATH_INDEX_CACHE[cache_key] = table
+    return table
+
+
 def build_dflash_verify_allow_mask(
     *,
     prefix_len: int,
     draft_token_num: int,
     num_candidates: int,
     candidate_block_size: int,
+    shared_prefix_len: int = 0,
     device: torch.device,
 ) -> torch.Tensor:
     """Build the per-request bool allow mask for DFLASH target verify.
@@ -66,25 +162,22 @@ def build_dflash_verify_allow_mask(
       own candidate branch up to the current local position
     """
 
-    q_len = int(candidate_block_size) * int(max(1, num_candidates))
+    num_candidates_i = int(max(1, num_candidates))
+    block_len = int(candidate_block_size)
+    shared_len = int(max(0, min(shared_prefix_len, block_len)))
+    template = _get_dflash_verify_suffix_template(
+        num_candidates=num_candidates_i,
+        candidate_block_size=block_len,
+        shared_prefix_len=shared_len,
+        device=device,
+    )
+    q_len = int(template.shape[0])
     prefix_len_i = int(prefix_len)
     kv_len = prefix_len_i + q_len
-    k_idx = torch.arange(kv_len, device=device, dtype=torch.int32).unsqueeze(0)
-    if int(max(1, num_candidates)) <= 1:
-        q_idx = torch.arange(q_len, device=device, dtype=torch.int32).unsqueeze(1)
-        return k_idx <= (prefix_len_i + q_idx)
-
-    block_len = int(candidate_block_size)
     allow = torch.zeros((q_len, kv_len), dtype=torch.bool, device=device)
     if prefix_len_i > 0:
         allow[:, :prefix_len_i] = True
-    for cand_idx in range(int(num_candidates)):
-        base = cand_idx * block_len
-        for local_pos in range(block_len):
-            q_idx_local = base + local_pos
-            k_begin = prefix_len_i + base
-            k_end = k_begin + local_pos + 1
-            allow[q_idx_local, k_begin:k_end] = True
+    allow[:, prefix_len_i : prefix_len_i + q_len] = template
     return allow
 
 
@@ -198,6 +291,9 @@ class DFlashVerifyInput(SpecInput):
     topk: int = 1
     num_candidates: int = 1
     candidate_block_size: int | None = None
+    # Number of shared deterministic tokens (from the start of each candidate block)
+    # packed once when compact tree verify is enabled.
+    shared_prefix_len: int = 0
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
@@ -215,7 +311,12 @@ class DFlashVerifyInput(SpecInput):
 
     @property
     def tokens_per_req(self) -> int:
-        return int(self.candidate_block_size) * int(max(1, self.num_candidates))
+        block_len = int(self.candidate_block_size)
+        num_candidates = int(max(1, self.num_candidates))
+        shared_len = int(max(0, min(self.shared_prefix_len, block_len)))
+        if num_candidates > 1 and 0 < shared_len < block_len:
+            return int(shared_len + num_candidates * (block_len - shared_len))
+        return int(block_len * num_candidates)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.tokens_per_req, self.tokens_per_req
@@ -284,6 +385,7 @@ class DFlashVerifyInput(SpecInput):
                 draft_token_num=int(self.draft_token_num),
                 num_candidates=int(self.num_candidates),
                 candidate_block_size=int(self.candidate_block_size),
+                shared_prefix_len=int(self.shared_prefix_len),
                 device=batch.device,
             )
             mask_chunks.append(allow.flatten())
@@ -373,10 +475,52 @@ class DFlashVerifyInput(SpecInput):
 
         num_candidates = int(self.num_candidates)
         block_len = int(self.candidate_block_size)
-        candidates = self.draft_token.view(bs, num_candidates, block_len)
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, num_candidates, block_len
-        )
+        shared_prefix_len = int(max(0, min(int(self.shared_prefix_len), block_len)))
+        compact_tree = bool(num_candidates > 1 and 0 < shared_prefix_len < block_len)
+
+        if compact_tree:
+            suffix_len = block_len - shared_prefix_len
+            compact_tokens_per_req = int(self.tokens_per_req)
+            compact_tokens = self.draft_token.view(bs, compact_tokens_per_req)
+            compact_target_predict = torch.argmax(
+                logits_output.next_token_logits, dim=-1
+            ).view(bs, compact_tokens_per_req)
+
+            candidates = torch.empty(
+                (bs, num_candidates, block_len), dtype=compact_tokens.dtype, device=device
+            )
+            target_predict = torch.empty(
+                (bs, num_candidates, block_len),
+                dtype=compact_target_predict.dtype,
+                device=device,
+            )
+            if shared_prefix_len > 0:
+                shared_tokens = compact_tokens[:, :shared_prefix_len]
+                shared_target_predict = compact_target_predict[:, :shared_prefix_len]
+                candidates[:, :, :shared_prefix_len] = shared_tokens.unsqueeze(1).expand(
+                    -1, num_candidates, -1
+                )
+                target_predict[:, :, :shared_prefix_len] = shared_target_predict.unsqueeze(
+                    1
+                ).expand(-1, num_candidates, -1)
+
+            suffix_tokens = compact_tokens[:, shared_prefix_len:].view(
+                bs, num_candidates, suffix_len
+            )
+            suffix_target_predict = compact_target_predict[:, shared_prefix_len:].view(
+                bs, num_candidates, suffix_len
+            )
+            candidates[:, :, shared_prefix_len:] = suffix_tokens
+            target_predict[:, :, shared_prefix_len:] = suffix_target_predict
+        else:
+            candidates = self.draft_token.view(bs, num_candidates, block_len)
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, num_candidates, block_len
+            )
+
+        chosen_candidate_idx = None
+        chosen_tau = None
+        chosen_next_token = None
         if block_len <= 1:
             accept_len = torch.zeros(
                 (bs, num_candidates), dtype=torch.int64, device=device
@@ -398,14 +542,40 @@ class DFlashVerifyInput(SpecInput):
         chosen_next_token = next_tokens_all.gather(
             1, chosen_candidate_idx.unsqueeze(1)
         ).squeeze(1)
+        chosen_tokens = candidates[
+            torch.arange(bs, dtype=torch.int64, device=device), chosen_candidate_idx
+        ]
+        # Single batched D2H transfer avoids repeated per-cycle GPU sync from .item().
+        packed_choice = torch.cat(
+            [
+                chosen_tokens.to(torch.int64),
+                chosen_next_token.unsqueeze(1).to(torch.int64),
+                chosen_tau.unsqueeze(1).to(torch.int64),
+            ],
+            dim=1,
+        ).cpu()
+        chosen_candidate_idx_cpu = chosen_candidate_idx.to(torch.int64).cpu()
 
-        out_cache_loc = batch.out_cache_loc.view(bs, num_candidates, block_len)
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, num_candidates, block_len, -1)
+        if compact_tree:
+            compact_tokens_per_req = int(self.tokens_per_req)
+            out_cache_loc_compact = batch.out_cache_loc.view(bs, compact_tokens_per_req)
+            hidden_compact = hidden.view(bs, compact_tokens_per_req, -1)
+            hidden_feature_dim = int(hidden_compact.shape[-1])
+            candidate_path_indices = _get_compact_candidate_path_indices(
+                num_candidates=num_candidates,
+                candidate_block_size=block_len,
+                shared_prefix_len=shared_prefix_len,
+                device=device,
+            )
+        else:
+            out_cache_loc = batch.out_cache_loc.view(bs, num_candidates, block_len)
+            hidden = hidden.view(bs, num_candidates, block_len, -1)
+            hidden_feature_dim = int(hidden.shape[-1])
 
         free_segments: List[torch.Tensor] = []
         kept_segments: List[torch.Tensor] = []
@@ -415,11 +585,11 @@ class DFlashVerifyInput(SpecInput):
         new_verified_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
-            chosen_idx = int(chosen_candidate_idx[i].item())
-            acc_len = int(chosen_tau[i].item()) - 1
-            chosen_tokens = candidates[i, chosen_idx]
-            proposed = chosen_tokens[1 : 1 + acc_len].tolist() + [
-                int(chosen_next_token[i].item())
+            chosen_idx = int(chosen_candidate_idx_cpu[i].item())
+            acc_len = int(packed_choice[i, block_len + 1].item()) - 1
+            chosen_tokens_cpu = packed_choice[i, :block_len]
+            proposed = chosen_tokens_cpu[1 : 1 + acc_len].tolist() + [
+                int(packed_choice[i, block_len].item())
             ]
 
             appended = 0
@@ -494,27 +664,45 @@ class DFlashVerifyInput(SpecInput):
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
             req.spec_draft_token_num += max(0, int(block_len) - 1)
 
-            keep = out_cache_loc[i, chosen_idx, :appended]
-            kept_segments.append(keep)
-            if appended > 0:
-                target_hidden_segments.append(hidden[i, chosen_idx, :appended, :])
+            if compact_tree:
+                chosen_path_idx = candidate_path_indices[chosen_idx]
+                keep = out_cache_loc_compact[i, chosen_path_idx[:appended]]
+                kept_segments.append(keep)
+                if appended > 0:
+                    target_hidden_segments.append(
+                        hidden_compact[i, chosen_path_idx[:appended], :]
+                    )
 
-            free_req = []
-            if chosen_idx > 0:
-                free_req.append(out_cache_loc[i, :chosen_idx, :].reshape(-1))
-            if chosen_idx + 1 < num_candidates:
-                free_req.append(out_cache_loc[i, chosen_idx + 1 :, :].reshape(-1))
-            if appended < block_len:
-                free_req.append(out_cache_loc[i, chosen_idx, appended:block_len])
-            if free_req:
-                free_segments.append(torch.cat(free_req, dim=0))
+                free_mask = torch.ones(
+                    (out_cache_loc_compact.shape[1],), dtype=torch.bool, device=device
+                )
+                if appended > 0:
+                    free_mask[chosen_path_idx[:appended]] = False
+                free_req = out_cache_loc_compact[i, free_mask]
+                if free_req.numel() > 0:
+                    free_segments.append(free_req)
+            else:
+                keep = out_cache_loc[i, chosen_idx, :appended]
+                kept_segments.append(keep)
+                if appended > 0:
+                    target_hidden_segments.append(hidden[i, chosen_idx, :appended, :])
+
+                free_req = []
+                if chosen_idx > 0:
+                    free_req.append(out_cache_loc[i, :chosen_idx, :].reshape(-1))
+                if chosen_idx + 1 < num_candidates:
+                    free_req.append(out_cache_loc[i, chosen_idx + 1 :, :].reshape(-1))
+                if appended < block_len:
+                    free_req.append(out_cache_loc[i, chosen_idx, appended:block_len])
+                if free_req:
+                    free_segments.append(torch.cat(free_req, dim=0))
 
         if free_segments:
             batch.token_to_kv_pool_allocator.free(torch.cat(free_segments, dim=0))
         batch.out_cache_loc = (
             torch.cat(kept_segments, dim=0)
             if kept_segments
-            else out_cache_loc.reshape(-1)[:0]
+            else batch.out_cache_loc[:0]
         )
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
@@ -545,7 +733,7 @@ class DFlashVerifyInput(SpecInput):
         next_target_hidden = (
             torch.cat(target_hidden_segments, dim=0)
             if target_hidden_segments
-            else hidden[:0, :0, :0, :].reshape(0, hidden.shape[-1])
+            else torch.empty((0, hidden_feature_dim), dtype=hidden.dtype, device=device)
         )
         logits_output.hidden_states = None
         return (

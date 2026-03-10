@@ -508,10 +508,47 @@ class CudaGraphRunner:
                             1,
                         )
                     )
-                    packed_tokens_per_bs = int(self.num_tokens_per_bs) * max_candidates
-                    self.num_tokens_per_bs = packed_tokens_per_bs
-                    dflash_capture_buckets = [packed_tokens_per_bs]
+                    candidate_block_size = int(
+                        max(
+                            1,
+                            getattr(
+                                self.model_runner.server_args,
+                                "speculative_dflash_block_size",
+                                self.num_tokens_per_bs,
+                            ),
+                        )
+                    )
+                    det_prefix_len = int(
+                        getattr(
+                            self.model_runner.server_args,
+                            "speculative_dflash_multi_candidate_deterministic_prefix_len",
+                            0,
+                        )
+                    )
+                    sample_start_pos = max(
+                        1,
+                        min(candidate_block_size, 1 + det_prefix_len),
+                    )
+                    compact_shared_prefix = int(sample_start_pos)
+                    multi_candidate_buckets = []
+                    for cand in range(1, max_candidates + 1):
+                        if (
+                            cand > 1
+                            and 0 < compact_shared_prefix < candidate_block_size
+                        ):
+                            q_len = compact_shared_prefix + cand * (
+                                candidate_block_size - compact_shared_prefix
+                            )
+                        else:
+                            q_len = candidate_block_size * cand
+                        multi_candidate_buckets.append(int(q_len))
+                    dflash_capture_buckets = sorted(set(multi_candidate_buckets))
+                    self.num_tokens_per_bs = int(max(dflash_capture_buckets))
                     dflash_bucket_reason = "multi_candidate"
+                    self._dflash_flashinfer_bucketed_replay_enabled = bool(
+                        self.model_runner.server_args.attention_backend == "flashinfer"
+                        and len(dflash_capture_buckets) > 1
+                    )
                 elif self.model_runner.server_args.speculative_dflash_adaptive_block_size:
                     k_min = int(
                         self.model_runner.server_args.speculative_dflash_adaptive_k_min
@@ -1265,8 +1302,18 @@ class CudaGraphRunner:
                 num_token_non_padded=len(forward_batch.input_ids),
                 spec_info=forward_batch.spec_info,
             )
-        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
+        if forward_batch.spec_info is not None:
+            runtime_custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
+            if runtime_custom_mask is not None:
+                mask_numel = int(runtime_custom_mask.numel())
+                if mask_numel > int(buffers.custom_mask.numel()):
+                    raise ValueError(
+                        "Runtime custom mask exceeds cuda-graph buffer capacity: "
+                        f"{mask_numel} > {int(buffers.custom_mask.numel())}"
+                    )
+                if runtime_custom_mask.data_ptr() != buffers.custom_mask.data_ptr():
+                    buffers.custom_mask[:mask_numel].copy_(runtime_custom_mask)
+                forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
@@ -1381,6 +1428,7 @@ class CudaGraphRunner:
             num_candidates = 1
             candidate_block_size = num_tokens_per_bs
             draft_token_num = num_tokens_per_bs
+            shared_prefix_len = 0
             if (
                 not self.model_runner.is_draft_worker
                 and getattr(
@@ -1389,15 +1437,59 @@ class CudaGraphRunner:
                     False,
                 )
             ):
-                num_candidates = int(
+                max_candidates = int(
                     getattr(
                         self.model_runner.server_args,
                         "speculative_dflash_multi_candidate_max_candidates",
                         1,
                     )
                 )
+                num_candidates = int(max_candidates)
                 candidate_block_size = int(
                     self.model_runner.server_args.speculative_dflash_block_size
+                )
+                det_prefix_len = int(
+                    getattr(
+                        self.model_runner.server_args,
+                        "speculative_dflash_multi_candidate_deterministic_prefix_len",
+                        0,
+                    )
+                )
+                sample_start_pos = max(
+                    1,
+                    min(candidate_block_size, 1 + det_prefix_len),
+                )
+                compact_shared_prefix = int(sample_start_pos)
+                layout_by_tokens: Dict[int, tuple[int, int]] = {}
+                for cand in range(1, max_candidates + 1):
+                    if (
+                        cand > 1
+                        and 0 < compact_shared_prefix < candidate_block_size
+                    ):
+                        q_len = compact_shared_prefix + cand * (
+                            candidate_block_size - compact_shared_prefix
+                        )
+                        shared = compact_shared_prefix
+                    else:
+                        q_len = candidate_block_size * cand
+                        shared = 0
+                    layout_by_tokens[int(q_len)] = (int(cand), int(shared))
+                (
+                    num_candidates,
+                    shared_prefix_len,
+                ) = layout_by_tokens.get(
+                    int(num_tokens_per_bs),
+                    (
+                        int(max_candidates),
+                        int(
+                            compact_shared_prefix
+                            if (
+                                max_candidates > 1
+                                and 0 < compact_shared_prefix < candidate_block_size
+                            )
+                            else 0
+                        ),
+                    ),
                 )
                 draft_token_num = candidate_block_size
 
@@ -1414,6 +1506,7 @@ class CudaGraphRunner:
                 topk=num_candidates,
                 num_candidates=num_candidates,
                 candidate_block_size=candidate_block_size,
+                shared_prefix_len=shared_prefix_len,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
