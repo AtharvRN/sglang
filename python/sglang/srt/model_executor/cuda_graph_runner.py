@@ -473,6 +473,7 @@ class CudaGraphRunner:
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
         self.capture_num_tokens_per_bs: List[int] = [1]
+        self._buffer_num_tokens_per_bs = 1
         self._dflash_flashinfer_bucketed_replay_enabled = False
         if (
             model_runner.spec_algorithm.is_eagle()
@@ -492,56 +493,106 @@ class CudaGraphRunner:
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
             self.capture_num_tokens_per_bs = [self.num_tokens_per_bs]
-            if (
-                self.model_runner.spec_algorithm.is_dflash()
-                and self.model_runner.server_args.speculative_dflash_adaptive_block_size
-            ):
-                k_min = int(
-                    self.model_runner.server_args.speculative_dflash_adaptive_k_min
-                    if self.model_runner.server_args.speculative_dflash_adaptive_k_min
-                    is not None
-                    else 1
-                )
-                k_max = int(
-                    self.model_runner.server_args.speculative_dflash_adaptive_k_max
-                    if self.model_runner.server_args.speculative_dflash_adaptive_k_max
-                    is not None
-                    else self.num_tokens_per_bs
-                )
-                configured_buckets = getattr(
+            if self.model_runner.spec_algorithm.is_dflash() and not self.model_runner.is_draft_worker:
+                dflash_capture_buckets: Optional[List[int]] = None
+                dflash_bucket_reason: Optional[str] = None
+                if getattr(
                     self.model_runner.server_args,
-                    "speculative_dflash_adaptive_block_buckets",
-                    None,
-                )
-                adaptive_buckets = (
-                    sorted(
-                        {
-                            int(v)
-                            for v in configured_buckets
-                            if int(v) >= k_min and int(v) <= k_max
-                        }
-                    )
-                    if configured_buckets
-                    else []
-                )
-                if self.num_tokens_per_bs not in adaptive_buckets:
-                    adaptive_buckets.append(int(self.num_tokens_per_bs))
-                    adaptive_buckets = sorted(set(adaptive_buckets))
-                self.capture_num_tokens_per_bs = adaptive_buckets
-                self._dflash_flashinfer_bucketed_replay_enabled = bool(
-                    self.model_runner.server_args.attention_backend == "flashinfer"
-                    and configured_buckets
-                    and len(adaptive_buckets) > 1
-                )
-                if (
-                    self.model_runner.server_args.attention_backend == "flashinfer"
-                    and len(adaptive_buckets) > 1
+                    "speculative_dflash_multi_candidate",
+                    False,
                 ):
-                    log_info_on_rank0(
-                        logger,
-                        "DFLASH FlashInfer bucketed cuda-graph replay is enabled. "
-                        f"runtime token buckets={adaptive_buckets}",
+                    max_candidates = int(
+                        getattr(
+                            self.model_runner.server_args,
+                            "speculative_dflash_multi_candidate_max_candidates",
+                            1,
+                        )
                     )
+                    packed_tokens_per_bs = int(self.num_tokens_per_bs) * max_candidates
+                    self.num_tokens_per_bs = packed_tokens_per_bs
+                    dflash_capture_buckets = [packed_tokens_per_bs]
+                    dflash_bucket_reason = "multi_candidate"
+                elif self.model_runner.server_args.speculative_dflash_adaptive_block_size:
+                    k_min = int(
+                        self.model_runner.server_args.speculative_dflash_adaptive_k_min
+                        if self.model_runner.server_args.speculative_dflash_adaptive_k_min
+                        is not None
+                        else 1
+                    )
+                    k_max = int(
+                        self.model_runner.server_args.speculative_dflash_adaptive_k_max
+                        if self.model_runner.server_args.speculative_dflash_adaptive_k_max
+                        is not None
+                        else self.num_tokens_per_bs
+                    )
+                    configured_buckets = getattr(
+                        self.model_runner.server_args,
+                        "speculative_dflash_adaptive_block_buckets",
+                        None,
+                    )
+                    adaptive_buckets = (
+                        sorted(
+                            {
+                                int(v)
+                                for v in configured_buckets
+                                if int(v) >= k_min and int(v) <= k_max
+                            }
+                        )
+                        if configured_buckets
+                        else []
+                    )
+                    if self.num_tokens_per_bs not in adaptive_buckets:
+                        adaptive_buckets.append(int(self.num_tokens_per_bs))
+                        adaptive_buckets = sorted(set(adaptive_buckets))
+                    dflash_capture_buckets = adaptive_buckets
+                    dflash_bucket_reason = "adaptive"
+                    self._dflash_flashinfer_bucketed_replay_enabled = bool(
+                        self.model_runner.server_args.attention_backend == "flashinfer"
+                        and configured_buckets
+                        and len(adaptive_buckets) > 1
+                    )
+                elif getattr(
+                    self.model_runner.server_args,
+                    "speculative_dflash_confidence_gate",
+                    False,
+                ):
+                    configured_buckets = getattr(
+                        self.model_runner.server_args,
+                        "speculative_dflash_confidence_gate_grouped_verify_buckets",
+                        None,
+                    )
+                    confidence_buckets = (
+                        sorted(
+                            {
+                                int(v)
+                                for v in configured_buckets
+                                if int(v) >= 1 and int(v) <= int(self.num_tokens_per_bs)
+                            }
+                        )
+                        if configured_buckets
+                        else list(range(1, int(self.num_tokens_per_bs) + 1))
+                    )
+                    if self.num_tokens_per_bs not in confidence_buckets:
+                        confidence_buckets.append(int(self.num_tokens_per_bs))
+                        confidence_buckets = sorted(set(confidence_buckets))
+                    dflash_capture_buckets = confidence_buckets
+                    dflash_bucket_reason = "confidence_gate"
+                    self._dflash_flashinfer_bucketed_replay_enabled = bool(
+                        self.model_runner.server_args.attention_backend == "flashinfer"
+                        and len(confidence_buckets) > 1
+                    )
+
+                if dflash_capture_buckets:
+                    self.capture_num_tokens_per_bs = dflash_capture_buckets
+                    if (
+                        self.model_runner.server_args.attention_backend == "flashinfer"
+                        and len(dflash_capture_buckets) > 1
+                    ):
+                        log_info_on_rank0(
+                            logger,
+                            "DFLASH FlashInfer bucketed cuda-graph replay is enabled. "
+                            f"reason={dflash_bucket_reason} runtime token buckets={dflash_capture_buckets}",
+                        )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -561,6 +612,7 @@ class CudaGraphRunner:
         # Backward-compatible aliases for code paths that use a single shape.
         self.capture_bs = self.capture_bs_by_num_tokens[self.num_tokens_per_bs]
         self.compile_bs = self.compile_bs_by_num_tokens[self.num_tokens_per_bs]
+        self._buffer_num_tokens_per_bs = max(self.capture_num_tokens_per_bs)
 
         if len(self.capture_num_tokens_per_bs) == 1:
             log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
@@ -612,7 +664,7 @@ class CudaGraphRunner:
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
-                num_tokens_per_bs=self.num_tokens_per_bs,
+                num_tokens_per_bs=self._buffer_num_tokens_per_bs,
             )
 
         enable_mamba_track = (
@@ -635,7 +687,7 @@ class CudaGraphRunner:
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
-            num_tokens_per_bs=self.num_tokens_per_bs,
+            num_tokens_per_bs=self._buffer_num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
         )
@@ -1326,6 +1378,29 @@ class CudaGraphRunner:
                 resolve_dflash_verify_mask_policy,
             )
 
+            num_candidates = 1
+            candidate_block_size = num_tokens_per_bs
+            draft_token_num = num_tokens_per_bs
+            if (
+                not self.model_runner.is_draft_worker
+                and getattr(
+                    self.model_runner.server_args,
+                    "speculative_dflash_multi_candidate",
+                    False,
+                )
+            ):
+                num_candidates = int(
+                    getattr(
+                        self.model_runner.server_args,
+                        "speculative_dflash_multi_candidate_max_candidates",
+                        1,
+                    )
+                )
+                candidate_block_size = int(
+                    self.model_runner.server_args.speculative_dflash_block_size
+                )
+                draft_token_num = candidate_block_size
+
             # Avoid enabling custom-mask modes during graph capture for backends that
             # can express DFLASH verify via their built-in causal path.
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
@@ -1334,7 +1409,10 @@ class CudaGraphRunner:
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=num_tokens_per_bs,
+                draft_token_num=draft_token_num,
+                topk=num_candidates,
+                num_candidates=num_candidates,
+                candidate_block_size=candidate_block_size,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
