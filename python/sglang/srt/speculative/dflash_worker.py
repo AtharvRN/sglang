@@ -2826,7 +2826,13 @@ class DFlashWorker:
                 candidate_info.get("sampled_suffix_start", runtime_block_size)
             )
             shared_prefix_len = int(
-                max(0, min(int(runtime_block_size), int(sampled_suffix_start)))
+                max(
+                    0,
+                    min(
+                        int(runtime_block_size),
+                        int(candidate_info.get("shared_prefix_len", sampled_suffix_start)),
+                    ),
+                )
             )
             compact_tree = bool(
                 num_candidates > 1
@@ -3524,6 +3530,18 @@ class DFlashWorker:
                     )
             candidate_tokens = deduped
 
+        shared_prefix_len = int(sample_start_pos)
+        if int(candidate_tokens.shape[1]) > 1:
+            # Collapse any extra sampled prefix that is still identical across all
+            # unique branches in the batch so packed verify forwards fewer suffix tokens.
+            common_prefix_mask = candidate_tokens.eq(candidate_tokens[:, :1, :]).all(dim=1)
+            common_prefix_len = (
+                common_prefix_mask.to(torch.int32).cumprod(dim=1).sum(dim=1)
+            )
+            shared_prefix_len = int(
+                max(shared_prefix_len, int(common_prefix_len.min().item()))
+            )
+
         return (
             candidate_tokens,
             {
@@ -3540,6 +3558,7 @@ class DFlashWorker:
                 if unique_counts
                 else 1.0,
                 "sampled_suffix_start": int(sample_start_pos),
+                "shared_prefix_len": int(shared_prefix_len),
             },
         )
 

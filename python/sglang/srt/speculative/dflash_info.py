@@ -29,6 +29,9 @@ _DFLASH_VERIFY_MASK_TEMPLATE_CACHE: Dict[
 _DFLASH_COMPACT_PATH_INDEX_CACHE: Dict[
     Tuple[str, int, int, int], torch.Tensor
 ] = {}
+_DFLASH_VERIFY_MASK_BUILD_CACHE: Dict[
+    Tuple[str, int], Dict[str, torch.Tensor]
+] = {}
 
 
 def _compute_paged_keep_slots(
@@ -179,6 +182,103 @@ def build_dflash_verify_allow_mask(
         allow[:, :prefix_len_i] = True
     allow[:, prefix_len_i : prefix_len_i + q_len] = template
     return allow
+
+
+def _get_or_create_dflash_verify_mask_build_buffers(
+    *,
+    device: torch.device,
+    bs: int,
+    q_len: int,
+    max_prefix_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return reusable staging buffers for batched DFLASH verify-mask assembly."""
+
+    width = int(max_prefix_len + q_len)
+    cache_key = (str(device), int(q_len))
+    cached = _DFLASH_VERIFY_MASK_BUILD_CACHE.get(cache_key)
+    cap_bs = 0 if cached is None else int(cached["dense_mask"].shape[0])
+    cap_width = 0 if cached is None else int(cached["dense_mask"].shape[2])
+
+    if cap_bs < bs or cap_width < width:
+        new_cap_bs = max(int(bs), cap_bs * 2 if cap_bs > 0 else int(bs))
+        new_cap_width = max(int(width), cap_width * 2 if cap_width > 0 else int(width))
+        cached = {
+            "dense_mask": torch.empty(
+                (new_cap_bs, q_len, new_cap_width),
+                dtype=torch.bool,
+                device=device,
+            ),
+            "all_cols": torch.arange(
+                new_cap_width, dtype=torch.int64, device=device
+            ),
+            "q_cols": torch.arange(q_len, dtype=torch.int64, device=device),
+        }
+        _DFLASH_VERIFY_MASK_BUILD_CACHE[cache_key] = cached
+
+    assert cached is not None
+    return (
+        cached["dense_mask"][:bs, :, :width],
+        cached["all_cols"][:width],
+        cached["q_cols"],
+    )
+
+
+def build_dflash_verify_allow_mask_batched(
+    *,
+    prefix_lens: torch.Tensor,
+    draft_token_num: int,
+    num_candidates: int,
+    candidate_block_size: int,
+    shared_prefix_len: int = 0,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the flattened per-batch allow mask for DFLASH target verify on GPU."""
+
+    if prefix_lens.numel() == 0:
+        return torch.empty((0,), dtype=torch.bool, device=device)
+
+    num_candidates_i = int(max(1, num_candidates))
+    block_len = int(candidate_block_size)
+    shared_len = int(max(0, min(shared_prefix_len, block_len)))
+    template = _get_dflash_verify_suffix_template(
+        num_candidates=num_candidates_i,
+        candidate_block_size=block_len,
+        shared_prefix_len=shared_len,
+        device=device,
+    )
+    q_len = int(template.shape[0])
+    if q_len <= 0 or int(draft_token_num) <= 0:
+        return torch.empty((0,), dtype=torch.bool, device=device)
+
+    prefix_lens_i64 = prefix_lens.to(device=device, dtype=torch.int64)
+    bs = int(prefix_lens_i64.numel())
+    max_prefix_len = int(prefix_lens_i64.max().item()) if bs > 0 else 0
+
+    dense_mask, all_cols, q_cols = _get_or_create_dflash_verify_mask_build_buffers(
+        device=device,
+        bs=bs,
+        q_len=q_len,
+        max_prefix_len=max_prefix_len,
+    )
+    dense_mask.zero_()
+
+    if max_prefix_len > 0:
+        dense_mask[:, :, :max_prefix_len] = (
+            all_cols[:max_prefix_len].view(1, 1, -1)
+            < prefix_lens_i64.view(bs, 1, 1)
+        )
+
+    template_indices = prefix_lens_i64.view(bs, 1, 1) + q_cols.view(1, 1, q_len)
+    dense_mask.scatter_(
+        2,
+        template_indices.expand(bs, q_len, q_len),
+        template.unsqueeze(0).expand(bs, -1, -1),
+    )
+
+    valid_cols = all_cols.view(1, 1, -1) < (
+        prefix_lens_i64 + int(q_len)
+    ).view(bs, 1, 1)
+    return dense_mask[valid_cols.expand(bs, q_len, valid_cols.shape[-1])].contiguous()
 
 
 @dataclass
@@ -377,22 +477,13 @@ class DFlashVerifyInput(SpecInput):
             raise ValueError(
                 f"DFLASH draft_token_num must be positive, got {self.draft_token_num}."
             )
-        mask_chunks: List[torch.Tensor] = []
-        q_len = int(self.tokens_per_req)
-        for prefix_len in batch.seq_lens_cpu.tolist():
-            allow = build_dflash_verify_allow_mask(
-                prefix_len=int(prefix_len),
-                draft_token_num=int(self.draft_token_num),
-                num_candidates=int(self.num_candidates),
-                candidate_block_size=int(self.candidate_block_size),
-                shared_prefix_len=int(self.shared_prefix_len),
-                device=batch.device,
-            )
-            mask_chunks.append(allow.flatten())
-        self.custom_mask = (
-            torch.cat(mask_chunks, dim=0)
-            if mask_chunks
-            else torch.empty((0,), dtype=torch.bool, device=batch.device)
+        self.custom_mask = build_dflash_verify_allow_mask_batched(
+            prefix_lens=batch.seq_lens,
+            draft_token_num=int(self.draft_token_num),
+            num_candidates=int(self.num_candidates),
+            candidate_block_size=int(self.candidate_block_size),
+            shared_prefix_len=int(self.shared_prefix_len),
+            device=batch.device,
         )
 
     def generate_attn_arg_prefill(
