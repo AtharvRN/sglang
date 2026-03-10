@@ -89,7 +89,11 @@ def scale_kv_cell_size_per_token_for_dflash(
     ) // int(target_num_layers)
 
 
-def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+def resolve_dflash_verify_mask_policy(
+    attn_backend: Any,
+    *,
+    num_candidates: int = 1,
+) -> tuple[str, bool]:
     backend = attn_backend
     for _ in range(4):
         full_backend = getattr(backend, "full_attn_backend", None)
@@ -97,6 +101,10 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
             break
         backend = full_backend
     backend_name = type(backend).__name__
+    if int(max(1, num_candidates)) > 1:
+        # Packed multi-candidate verify requires an explicit branch-isolation
+        # mask. Built-in causal paths are only valid for the single-candidate case.
+        return backend_name, True
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 

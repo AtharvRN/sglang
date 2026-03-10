@@ -2813,7 +2813,8 @@ class DFlashWorker:
                 candidate_block_size=int(runtime_block_size),
             )
             verify_mask_backend, build_custom_mask = resolve_dflash_verify_mask_policy(
-                self.model_runner.attn_backend
+                self.model_runner.attn_backend,
+                num_candidates=num_candidates,
             )
             verify_input.prepare_for_verify(
                 batch,
@@ -2947,7 +2948,8 @@ class DFlashWorker:
             draft_token_num=verify_token_num,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
-            self.model_runner.attn_backend
+            self.model_runner.attn_backend,
+            num_candidates=1,
         )
         verify_input.prepare_for_verify(
             batch,
@@ -3743,7 +3745,8 @@ class DFlashWorker:
             draft_seq_lens_work = draft_input.draft_seq_lens.clone()
 
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
-                self.model_runner.attn_backend
+                self.model_runner.attn_backend,
+                num_candidates=1,
             )
 
             for verify_k, keep_indices in grouped_verify_plan:

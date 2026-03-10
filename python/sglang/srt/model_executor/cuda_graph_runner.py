@@ -1404,7 +1404,8 @@ class CudaGraphRunner:
             # Avoid enabling custom-mask modes during graph capture for backends that
             # can express DFLASH verify via their built-in causal path.
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
-                self.model_runner.attn_backend
+                self.model_runner.attn_backend,
+                num_candidates=num_candidates,
             )
             spec_info = DFlashVerifyInput(
                 draft_token=None,
