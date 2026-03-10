@@ -970,6 +970,26 @@ class DFlashWorker:
         sub_batch.mamba_track_seqlens = None
         return sub_batch
 
+    def _split_flat_hidden_by_commit_lens(
+        self,
+        hidden: torch.Tensor,
+        commit_lens_cpu: list[int],
+    ) -> list[torch.Tensor | None]:
+        segments: list[torch.Tensor | None] = []
+        offset = 0
+        for ln in commit_lens_cpu:
+            ln_i = int(ln)
+            if ln_i > 0:
+                segments.append(hidden[offset : offset + ln_i])
+                offset += ln_i
+            else:
+                segments.append(None)
+        if offset != int(hidden.shape[0]):
+            raise RuntimeError(
+                f"DFLASH hidden segment split mismatch: consumed={offset}, total={int(hidden.shape[0])}."
+            )
+        return segments
+
     def _update_confidence_gate_state(
         self,
         *,
@@ -2798,24 +2818,40 @@ class DFlashWorker:
                 lm_head=lm_head,
             )
             num_candidates = int(candidate_tokens_3d.shape[1])
-            candidate_positions = (
-                positions_2d[:, :runtime_block_size]
-                .unsqueeze(1)
-                .expand(bs, num_candidates, runtime_block_size)
-                .contiguous()
+            sample_start_pos = int(
+                candidate_info.get("sampled_suffix_start", runtime_block_size)
             )
-            verify_input = DFlashVerifyInput(
-                draft_token=candidate_tokens_3d.reshape(-1).contiguous(),
-                positions=candidate_positions.reshape(-1).contiguous(),
-                draft_token_num=int(runtime_block_size),
-                topk=int(num_candidates),
-                num_candidates=int(num_candidates),
-                candidate_block_size=int(runtime_block_size),
-            )
-            verify_mask_backend, build_custom_mask = resolve_dflash_verify_mask_policy(
-                self.model_runner.attn_backend,
-                num_candidates=num_candidates,
-            )
+            staged_verify = bool(num_candidates > 1 and sample_start_pos > 1)
+            if staged_verify:
+                shared_verify_k = int(sample_start_pos)
+                verify_input = DFlashVerifyInput(
+                    draft_token=draft_tokens[:, :shared_verify_k].reshape(-1).contiguous(),
+                    positions=positions_2d[:, :shared_verify_k].reshape(-1).contiguous(),
+                    draft_token_num=int(shared_verify_k),
+                )
+                verify_mask_backend, build_custom_mask = resolve_dflash_verify_mask_policy(
+                    self.model_runner.attn_backend,
+                    num_candidates=1,
+                )
+            else:
+                candidate_positions = (
+                    positions_2d[:, :runtime_block_size]
+                    .unsqueeze(1)
+                    .expand(bs, num_candidates, runtime_block_size)
+                    .contiguous()
+                )
+                verify_input = DFlashVerifyInput(
+                    draft_token=candidate_tokens_3d.reshape(-1).contiguous(),
+                    positions=candidate_positions.reshape(-1).contiguous(),
+                    draft_token_num=int(runtime_block_size),
+                    topk=int(num_candidates),
+                    num_candidates=int(num_candidates),
+                    candidate_block_size=int(runtime_block_size),
+                )
+                verify_mask_backend, build_custom_mask = resolve_dflash_verify_mask_policy(
+                    self.model_runner.attn_backend,
+                    num_candidates=num_candidates,
+                )
             verify_input.prepare_for_verify(
                 batch,
                 self.page_size,
@@ -2849,8 +2885,20 @@ class DFlashWorker:
                 "candidate_tokens_3d": candidate_tokens_3d,
                 "runtime_block_size": int(runtime_block_size),
                 "candidate_block_size": int(runtime_block_size),
+                "staged_verify": bool(staged_verify),
+                "shared_verify_token_num": int(sample_start_pos)
+                if staged_verify
+                else 0,
+                "suffix_verify_token_num": int(runtime_block_size - sample_start_pos + 1)
+                if staged_verify
+                else int(runtime_block_size),
                 "effective_verify_tokens_per_req": int(
-                    runtime_block_size * num_candidates
+                    (
+                        sample_start_pos
+                        + (runtime_block_size - sample_start_pos + 1) * num_candidates
+                    )
+                    if staged_verify
+                    else runtime_block_size * num_candidates
                 ),
                 "verify_mask_backend": str(verify_mask_backend),
                 "build_custom_mask": bool(build_custom_mask),
@@ -3390,11 +3438,37 @@ class DFlashWorker:
             hidden_states=suffix_hidden,
             lm_head=lm_head,
         )
+        if valid_token_ids.numel() == 0:
+            raise RuntimeError(
+                "DFLASH multi-candidate sampling produced an empty valid vocab."
+            )
         logits = logits.view(bs, num_suffix, -1)
-        probs = torch.softmax(
-            logits / float(max(self._multi_candidate_sample_temperature, 1e-6)),
-            dim=-1,
+        scaled_logits = logits / float(max(self._multi_candidate_sample_temperature, 1e-6))
+        scaled_logits = torch.nan_to_num(
+            scaled_logits,
+            nan=-1e9,
+            posinf=1e4,
+            neginf=-1e9,
         )
+        probs = torch.softmax(scaled_logits, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs_sum = probs.sum(dim=-1, keepdim=True)
+        valid_prob_rows = torch.isfinite(probs_sum) & (probs_sum > 0)
+        probs = probs / probs_sum.clamp_min(1e-12)
+        if not bool(valid_prob_rows.all()):
+            invalid_rows = int((~valid_prob_rows).sum().item())
+            logger.warning(
+                "DFLASH multi-candidate sampling encountered %d invalid probability rows; "
+                "falling back to argmax candidates for those rows.",
+                invalid_rows,
+            )
+            fallback_index = torch.argmax(scaled_logits, dim=-1, keepdim=True)
+            fallback_probs = torch.zeros_like(probs).scatter_(
+                dim=-1,
+                index=fallback_index,
+                value=1.0,
+            )
+            probs = torch.where(valid_prob_rows.expand_as(probs), probs, fallback_probs)
         probs = probs.reshape(bs * num_suffix, -1)
 
         extra = int(max_candidates - 1)
@@ -3885,31 +3959,212 @@ class DFlashWorker:
             assert model_worker_batch.forward_mode.is_target_verify()
             verify_input = model_worker_batch.spec_info
             assert isinstance(verify_input, DFlashVerifyInput)
-
-            batch_result, verify_time_s = self._measure_forward_s(
-                lambda: self.target_worker.forward_batch_generation(
-                    model_worker_batch, is_verify=True, **kwargs
+            multi_candidate_info = getattr(self, "_last_multi_candidate_info", None)
+            staged_multi_candidate = bool(
+                isinstance(multi_candidate_info, dict)
+                and multi_candidate_info.get("staged_verify", False)
+            )
+            if not staged_multi_candidate:
+                batch_result, verify_time_s = self._measure_forward_s(
+                    lambda: self.target_worker.forward_batch_generation(
+                        model_worker_batch, is_verify=True, **kwargs
+                    )
                 )
-            )
-            if self._report_timing and self.tp_rank == 0:
-                self._accumulate_req_shared_time(
-                    batch.reqs, "spec_verify_time_s", float(verify_time_s)
+                if self._report_timing and self.tp_rank == 0:
+                    self._accumulate_req_shared_time(
+                        batch.reqs, "spec_verify_time_s", float(verify_time_s)
+                    )
+                logits_output, can_run_cuda_graph = (
+                    batch_result.logits_output,
+                    batch_result.can_run_cuda_graph,
                 )
-            logits_output, can_run_cuda_graph = (
-                batch_result.logits_output,
-                batch_result.can_run_cuda_graph,
-            )
 
-            (
-                new_verified_id,
-                commit_lens,
-                next_target_hidden,
-                accept_length_per_req_cpu,
-            ) = verify_input.verify(
-                batch=batch,
-                logits_output=logits_output,
-                page_size=self.page_size,
-            )
+                (
+                    new_verified_id,
+                    commit_lens,
+                    next_target_hidden,
+                    accept_length_per_req_cpu,
+                ) = verify_input.verify(
+                    batch=batch,
+                    logits_output=logits_output,
+                    page_size=self.page_size,
+                )
+            else:
+                assert isinstance(multi_candidate_info, dict)
+                assert self._last_verify_positions_2d is not None
+                batch_result, verify_time_s = self._measure_forward_s(
+                    lambda: self.target_worker.forward_batch_generation(
+                        model_worker_batch, is_verify=True, **kwargs
+                    )
+                )
+                if self._report_timing and self.tp_rank == 0:
+                    self._accumulate_req_shared_time(
+                        batch.reqs, "spec_verify_time_s", float(verify_time_s)
+                    )
+                logits_output, can_run_cuda_graph = (
+                    batch_result.logits_output,
+                    batch_result.can_run_cuda_graph,
+                )
+
+                shared_verify_token_num = int(
+                    multi_candidate_info.get("shared_verify_token_num", 0)
+                )
+                shared_accept_draft_tokens = max(0, shared_verify_token_num - 1)
+                (
+                    new_verified_id,
+                    commit_lens,
+                    next_target_hidden,
+                    accept_length_per_req_cpu,
+                    continue_mask,
+                ) = verify_input.verify_shared_prefix_stage(
+                    batch=batch,
+                    logits_output=logits_output,
+                    page_size=self.page_size,
+                    shared_accept_draft_tokens=shared_accept_draft_tokens,
+                )
+                commit_lens_cpu = [int(x) for x in commit_lens.tolist()]
+                final_hidden_segments = self._split_flat_hidden_by_commit_lens(
+                    next_target_hidden, commit_lens_cpu
+                )
+
+                continue_indices = [
+                    i for i in range(batch.batch_size()) if bool(continue_mask[i].item())
+                ]
+                continue_set = set(continue_indices)
+                if continue_indices:
+                    keep_indices_device = torch.tensor(
+                        continue_indices, dtype=torch.int64, device=batch.device
+                    )
+                    sub_batch = self._build_verify_sub_batch(
+                        batch=batch,
+                        keep_indices=continue_indices,
+                        keep_indices_device=keep_indices_device,
+                    )
+                    candidate_tokens_3d = multi_candidate_info["candidate_tokens_3d"]
+                    sample_start_pos = int(
+                        multi_candidate_info.get("sampled_suffix_start", runtime_bs)
+                    )
+                    suffix_tokens_3d = candidate_tokens_3d[
+                        keep_indices_device, :, sample_start_pos - 1 : int(runtime_bs)
+                    ].contiguous()
+                    suffix_block_size = int(suffix_tokens_3d.shape[2])
+                    suffix_positions_2d = self._last_verify_positions_2d[
+                        keep_indices_device, sample_start_pos - 1 : int(runtime_bs)
+                    ]
+                    suffix_positions_3d = (
+                        suffix_positions_2d.unsqueeze(1)
+                        .expand(
+                            len(continue_indices),
+                            int(suffix_tokens_3d.shape[1]),
+                            suffix_block_size,
+                        )
+                        .contiguous()
+                    )
+                    suffix_verify_input = DFlashVerifyInput(
+                        draft_token=suffix_tokens_3d.reshape(-1).contiguous(),
+                        positions=suffix_positions_3d.reshape(-1).contiguous(),
+                        draft_token_num=int(suffix_block_size),
+                        topk=int(suffix_tokens_3d.shape[1]),
+                        num_candidates=int(suffix_tokens_3d.shape[1]),
+                        candidate_block_size=int(suffix_block_size),
+                    )
+                    _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                        self.model_runner.attn_backend,
+                        num_candidates=int(suffix_tokens_3d.shape[1]),
+                    )
+                    multi_candidate_info["suffix_build_custom_mask"] = bool(
+                        build_custom_mask
+                    )
+                    multi_candidate_info["staged_verify_applied"] = True
+                    suffix_verify_input.prepare_for_verify(
+                        sub_batch,
+                        self.page_size,
+                        build_custom_mask=build_custom_mask,
+                    )
+                    sub_batch.spec_info = suffix_verify_input
+                    sub_batch.return_hidden_states = False
+
+                    sub_model_worker_batch = sub_batch.get_model_worker_batch()
+                    assert sub_model_worker_batch.forward_mode.is_target_verify()
+                    sub_batch_result, sub_verify_time_s = self._measure_forward_s(
+                        lambda: self.target_worker.forward_batch_generation(
+                            sub_model_worker_batch, is_verify=True, **kwargs
+                        )
+                    )
+                    verify_time_s += float(sub_verify_time_s)
+                    if self._report_timing and self.tp_rank == 0:
+                        self._accumulate_req_shared_time(
+                            sub_batch.reqs,
+                            "spec_verify_time_s",
+                            float(sub_verify_time_s),
+                        )
+                    logits_output = sub_batch_result.logits_output
+                    can_run_cuda_graph = bool(
+                        can_run_cuda_graph and sub_batch_result.can_run_cuda_graph
+                    )
+
+                    (
+                        sub_new_verified_id,
+                        sub_commit_lens,
+                        sub_next_target_hidden,
+                        sub_accept_length_per_req_cpu,
+                    ) = suffix_verify_input.verify(
+                        batch=sub_batch,
+                        logits_output=logits_output,
+                        page_size=self.page_size,
+                    )
+
+                    batch.seq_lens[keep_indices_device] = sub_batch.seq_lens
+                    if isinstance(batch.seq_lens_cpu, torch.Tensor):
+                        batch.seq_lens_cpu[continue_indices] = sub_batch.seq_lens_cpu
+                    else:
+                        for local_i, global_i in enumerate(continue_indices):
+                            batch.seq_lens_cpu[global_i] = int(
+                                sub_batch.seq_lens_cpu[local_i]
+                            )
+                    batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+
+                    new_verified_id[keep_indices_device] = sub_new_verified_id
+                    commit_lens[keep_indices_device] += sub_commit_lens
+                    sub_commit_lens_cpu = [int(x) for x in sub_commit_lens.tolist()]
+                    sub_hidden_segments = self._split_flat_hidden_by_commit_lens(
+                        sub_next_target_hidden, sub_commit_lens_cpu
+                    )
+                    for local_i, global_i in enumerate(continue_indices):
+                        accept_length_per_req_cpu[global_i] += int(
+                            sub_accept_length_per_req_cpu[local_i]
+                        )
+                        sub_seg = sub_hidden_segments[local_i]
+                        if sub_seg is None:
+                            continue
+                        base_seg = final_hidden_segments[global_i]
+                        final_hidden_segments[global_i] = (
+                            sub_seg
+                            if base_seg is None
+                            else torch.cat([base_seg, sub_seg], dim=0)
+                        )
+
+                next_target_hidden = (
+                    torch.cat(
+                        [seg for seg in final_hidden_segments if seg is not None], dim=0
+                    )
+                    if any(seg is not None for seg in final_hidden_segments)
+                    else next_target_hidden[:0]
+                )
+
+                total_draft_tokens = int(
+                    multi_candidate_info.get("runtime_block_size", runtime_bs)
+                ) - 1
+                for req_idx, req in enumerate(batch.reqs):
+                    if req_idx in continue_set:
+                        req.spec_accepted_tokens += int(shared_accept_draft_tokens)
+                        req.spec_draft_token_num += int(shared_accept_draft_tokens)
+                    else:
+                        req.spec_verify_ct += 1
+                        req.spec_accepted_tokens += int(
+                            accept_length_per_req_cpu[req_idx]
+                        )
+                        req.spec_draft_token_num += int(total_draft_tokens)
         if logits_output is None:
             raise RuntimeError(
                 "DFLASH verify produced no logits output; this should never happen."
@@ -3960,6 +4215,16 @@ class DFlashWorker:
                 "candidate_block_size": int(
                     multi_candidate_info.get("candidate_block_size", runtime_bs)
                 ),
+                "staged_verify": bool(multi_candidate_info.get("staged_verify", False)),
+                "shared_verify_token_num": int(
+                    multi_candidate_info.get("shared_verify_token_num", 0)
+                ),
+                "suffix_verify_token_num": int(
+                    multi_candidate_info.get("suffix_verify_token_num", runtime_bs)
+                ),
+                "staged_verify_applied": bool(
+                    multi_candidate_info.get("staged_verify_applied", False)
+                ),
                 "effective_verify_tokens_per_req": int(
                     multi_candidate_info.get(
                         "effective_verify_tokens_per_req",
@@ -3972,6 +4237,9 @@ class DFlashWorker:
                 ),
                 "verify_mask_backend": multi_candidate_info.get("verify_mask_backend"),
                 "build_custom_mask": multi_candidate_info.get("build_custom_mask"),
+                "suffix_build_custom_mask": multi_candidate_info.get(
+                    "suffix_build_custom_mask"
+                ),
                 "verify_mode": str(self._multi_candidate_verify_mode),
             }
         for req in batch.reqs:
