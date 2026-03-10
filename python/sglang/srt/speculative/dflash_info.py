@@ -50,6 +50,44 @@ def _compute_paged_keep_slots(
     return keep_slots
 
 
+def build_dflash_verify_allow_mask(
+    *,
+    prefix_len: int,
+    draft_token_num: int,
+    num_candidates: int,
+    candidate_block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the per-request bool allow mask for DFLASH target verify.
+
+    Semantics:
+    - single candidate: standard causal verify over the drafted block
+    - multi candidate: each query attends to the full shared prefix and only its
+      own candidate branch up to the current local position
+    """
+
+    q_len = int(candidate_block_size) * int(max(1, num_candidates))
+    prefix_len_i = int(prefix_len)
+    kv_len = prefix_len_i + q_len
+    k_idx = torch.arange(kv_len, device=device, dtype=torch.int32).unsqueeze(0)
+    if int(max(1, num_candidates)) <= 1:
+        q_idx = torch.arange(q_len, device=device, dtype=torch.int32).unsqueeze(1)
+        return k_idx <= (prefix_len_i + q_idx)
+
+    block_len = int(candidate_block_size)
+    allow = torch.zeros((q_len, kv_len), dtype=torch.bool, device=device)
+    if prefix_len_i > 0:
+        allow[:, :prefix_len_i] = True
+    for cand_idx in range(int(num_candidates)):
+        base = cand_idx * block_len
+        for local_pos in range(block_len):
+            q_idx_local = base + local_pos
+            k_begin = prefix_len_i + base
+            k_end = k_begin + local_pos + 1
+            allow[q_idx_local, k_begin:k_end] = True
+    return allow
+
+
 @dataclass
 class DFlashDraftInput(SpecInput):
     """Per-batch DFlash draft state for spec-v1 (non-overlap) scheduling.
@@ -241,32 +279,13 @@ class DFlashVerifyInput(SpecInput):
         mask_chunks: List[torch.Tensor] = []
         q_len = int(self.tokens_per_req)
         for prefix_len in batch.seq_lens_cpu.tolist():
-            prefix_len_i = int(prefix_len)
-            kv_len = prefix_len_i + q_len
-            k_idx = torch.arange(
-                kv_len, device=batch.device, dtype=torch.int32
-            ).unsqueeze(0)
-            if int(self.num_candidates) <= 1:
-                q_idx = torch.arange(
-                    q_len, device=batch.device, dtype=torch.int32
-                ).unsqueeze(1)
-                # Allow attending to the full prefix and to tokens up to (and including) the
-                # current query position within the verify block (standard causal masking).
-                allow = k_idx <= (prefix_len_i + q_idx)
-            else:
-                block_len = int(self.candidate_block_size)
-                allow = torch.zeros(
-                    (q_len, kv_len), dtype=torch.bool, device=batch.device
-                )
-                if prefix_len_i > 0:
-                    allow[:, :prefix_len_i] = True
-                for cand_idx in range(int(self.num_candidates)):
-                    base = cand_idx * block_len
-                    for local_pos in range(block_len):
-                        q_idx_local = base + local_pos
-                        k_begin = prefix_len_i + base
-                        k_end = k_begin + local_pos + 1
-                        allow[q_idx_local, k_begin:k_end] = True
+            allow = build_dflash_verify_allow_mask(
+                prefix_len=int(prefix_len),
+                draft_token_num=int(self.draft_token_num),
+                num_candidates=int(self.num_candidates),
+                candidate_block_size=int(self.candidate_block_size),
+                device=batch.device,
+            )
             mask_chunks.append(allow.flatten())
         self.custom_mask = (
             torch.cat(mask_chunks, dim=0)
