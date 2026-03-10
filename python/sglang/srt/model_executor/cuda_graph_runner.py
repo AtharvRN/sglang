@@ -1066,11 +1066,11 @@ class CudaGraphRunner:
             else None
         )
 
-        if stream_idx is None:
-            attn_backend = self.model_runner.attn_backend
-        else:
-            assert self.enable_pdmux
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+        attn_backend = self.model_runner.get_attention_backend_for_forward(
+            self.capture_forward_mode,
+            spec_info=spec_info,
+            stream_idx=stream_idx,
+        )
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,

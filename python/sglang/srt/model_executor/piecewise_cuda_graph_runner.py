@@ -357,7 +357,9 @@ class PiecewiseCudaGraphRunner:
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
+                attn_backend=self.model_runner.get_attention_backend_for_forward(
+                    ForwardMode.EXTEND
+                ),
                 out_cache_loc=out_cache_loc,
                 out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
@@ -388,7 +390,7 @@ class PiecewiseCudaGraphRunner:
             )
 
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
@@ -511,7 +513,9 @@ class PiecewiseCudaGraphRunner:
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
+                attn_backend=self.model_runner.get_attention_backend_for_forward(
+                    ForwardMode.EXTEND
+                ),
                 out_cache_loc=out_cache_loc,
                 out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
@@ -545,7 +549,7 @@ class PiecewiseCudaGraphRunner:
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         # Run and capture
         def run_once():
@@ -687,7 +691,7 @@ class PiecewiseCudaGraphRunner:
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
+            attn_backend=forward_batch.attn_backend,
             out_cache_loc=out_cache_loc,
             out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=forward_batch.seq_lens_sum,
@@ -733,7 +737,7 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(

@@ -644,7 +644,10 @@ class CPUGraphRunner:
             seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
+            attn_backend=self.model_runner.get_attention_backend_for_forward(
+                self.capture_forward_mode,
+                spec_info=spec_info,
+            ),
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -658,7 +661,7 @@ class CPUGraphRunner:
         )
 
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
+        forward_batch.attn_backend.init_forward_metadata_capture_cpu_graph(
             bs,
             num_tokens,
             req_pool_indices,
@@ -736,7 +739,7 @@ class CPUGraphRunner:
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
         self.recapture_if_needed(forward_batch)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
         output = self.graphs[forward_batch.batch_size](
             forward_batch.input_ids,
             forward_batch.positions,

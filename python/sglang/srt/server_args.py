@@ -528,6 +528,9 @@ class ServerArgs:
     speculative_dflash_multi_candidate_sample_temperature: float = 1.0
     speculative_dflash_multi_candidate_deterministic_prefix_len: int = 0
     speculative_dflash_multi_candidate_verify_mode: Literal["packed_tree"] = "packed_tree"
+    speculative_dflash_multi_candidate_verify_attention_backend: Optional[
+        Literal["triton"]
+    ] = None
     speculative_dflash_cycle_trace: bool = False
     speculative_dflash_predictor_dataset_output_dir: Optional[str] = None
     speculative_dflash_predictor_dataset_shard_rows: int = 100000
@@ -3023,6 +3026,29 @@ class ServerArgs:
                     deterministic_prefix_len
                 )
 
+                verify_backend = (
+                    self.speculative_dflash_multi_candidate_verify_attention_backend
+                )
+                if verify_backend is not None:
+                    verify_backend = str(verify_backend).strip()
+                    if verify_backend != "triton":
+                        raise ValueError(
+                            "DFLASH multi-candidate verify attention backend only "
+                            "supports 'triton' today. "
+                            f"Got {self.speculative_dflash_multi_candidate_verify_attention_backend}."
+                        )
+                    self.speculative_dflash_multi_candidate_verify_attention_backend = (
+                        verify_backend
+                    )
+            elif (
+                self.speculative_dflash_multi_candidate_verify_attention_backend
+                is not None
+            ):
+                raise ValueError(
+                    "--speculative-dflash-multi-candidate-verify-attention-backend "
+                    "requires --speculative-dflash-multi-candidate."
+                )
+
                 verify_mode = str(
                     self.speculative_dflash_multi_candidate_verify_mode
                 ).lower().strip()
@@ -5032,6 +5058,17 @@ class ServerArgs:
             default=ServerArgs.speculative_dflash_multi_candidate_verify_mode,
             choices=["packed_tree"],
             help="DFLASH multi-candidate verify mode.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-multi-candidate-verify-attention-backend",
+            type=str,
+            default=ServerArgs.speculative_dflash_multi_candidate_verify_attention_backend,
+            choices=["triton"],
+            help=(
+                "Override only packed multi-candidate DFLASH target verification "
+                "to a masked backend. 'triton' is the current serving-side "
+                "equivalent of the Transformers SDPA tree-verify path."
+            ),
         )
         parser.add_argument(
             "--speculative-dflash-cycle-trace",

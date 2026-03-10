@@ -1797,6 +1797,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        self._attention_backend_overrides = {}
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -1861,6 +1862,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             get_global_server_args().decode_attention_backend,
         ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
         return attn_backend
+
+    def get_attention_backend_for_forward(
+        self,
+        forward_mode: ForwardMode,
+        spec_info=None,
+        stream_idx: Optional[int] = None,
+    ):
+        override_backend = None
+        if (
+            not self.is_draft_worker
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_dflash()
+            and forward_mode.is_target_verify()
+            and getattr(spec_info, "num_candidates", 1) > 1
+        ):
+            override_backend = (
+                self.server_args.speculative_dflash_multi_candidate_verify_attention_backend
+            )
+
+        if override_backend is not None:
+            if override_backend not in self._attention_backend_overrides:
+                self._attention_backend_overrides[override_backend] = (
+                    self._get_attention_backend_from_str(override_backend)
+                )
+            return self._attention_backend_overrides[override_backend]
+
+        if stream_idx is not None:
+            assert self.server_args.enable_pdmux
+            return self.decode_attn_backend_group[stream_idx]
+        if self.server_args.enable_pdmux and (
+            forward_mode.is_decode() or forward_mode.is_target_verify()
+        ):
+            return self.decode_attn_backend
+        return self.attn_backend
 
     def _get_attention_backend_from_str(
         self, backend_str: str, init_new_workspace: bool = False
@@ -2144,7 +2179,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             orig_seq_lens=buffers.seq_lens,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
-            attn_backend=self.attn_backend,
+            attn_backend=self.get_attention_backend_for_forward(
+                capture_forward_mode,
+                spec_info=spec_info,
+            ),
             out_cache_loc=buffers.out_cache_loc,
             seq_lens_sum=buffers.seq_lens.sum().item(),
             encoder_lens=buffers.encoder_lens,
@@ -2172,7 +2210,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if lora_ids is not None:
             self.lora_manager.prepare_lora_batch(forward_batch)
 
-        self.attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -2381,10 +2419,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
-                self.decode_attn_backend.init_forward_metadata(forward_batch)
-                forward_batch.attn_backend = self.decode_attn_backend
+                forward_batch.attn_backend = self.get_attention_backend_for_forward(
+                    forward_batch.forward_mode,
+                    spec_info=forward_batch.spec_info,
+                )
             else:
-                self.attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.attn_backend = self.get_attention_backend_for_forward(
+                    forward_batch.forward_mode,
+                    spec_info=forward_batch.spec_info,
+                )
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -2424,7 +2468,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if not skip_attn_backend_init:
-            self.attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         return (
             self.model.forward(
@@ -2443,7 +2487,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # in this case, we need to reinit the forward metadata, otherwise the stale
         # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
         if forward_batch.batch_size > 0:
-            self.attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         kwargs = {}
         if self.support_pp:
@@ -2462,7 +2506,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_count: int = 1,
     ) -> LogitsProcessorOutput:
         if forward_batch.split_index == 0 or reinit_attn_backend:
-            self.attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
