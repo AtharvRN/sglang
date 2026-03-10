@@ -523,6 +523,11 @@ class ServerArgs:
     speculative_dflash_confidence_gate_mab_arms: Optional[List[float]] = None
     speculative_dflash_confidence_gate_grouped_verify: bool = False
     speculative_dflash_confidence_gate_grouped_verify_buckets: Optional[List[int]] = None
+    speculative_dflash_multi_candidate: bool = False
+    speculative_dflash_multi_candidate_max_candidates: int = 4
+    speculative_dflash_multi_candidate_sample_temperature: float = 1.0
+    speculative_dflash_multi_candidate_deterministic_prefix_len: int = 0
+    speculative_dflash_multi_candidate_verify_mode: Literal["packed_tree"] = "packed_tree"
     speculative_dflash_cycle_trace: bool = False
     speculative_dflash_predictor_dataset_output_dir: Optional[str] = None
     speculative_dflash_predictor_dataset_shard_rows: int = 100000
@@ -2777,6 +2782,9 @@ class ServerArgs:
             self.speculative_dflash_confidence_gate_grouped_verify = bool(
                 self.speculative_dflash_confidence_gate_grouped_verify
             )
+            self.speculative_dflash_multi_candidate = bool(
+                self.speculative_dflash_multi_candidate
+            )
             if self.speculative_dflash_confidence_gate_mab:
                 self.speculative_dflash_confidence_gate = True
             if self.speculative_dflash_confidence_gate_grouped_verify:
@@ -2974,6 +2982,56 @@ class ServerArgs:
                             f"Got {self.speculative_dflash_predictor_dataset_shard_rows}."
                         )
                     self.speculative_dflash_predictor_dataset_shard_rows = shard_rows
+
+            if self.speculative_dflash_multi_candidate:
+                if self.speculative_dflash_confidence_gate:
+                    raise ValueError(
+                        "DFLASH multi-candidate mode is currently incompatible with confidence-gated verify."
+                    )
+                max_candidates = int(
+                    self.speculative_dflash_multi_candidate_max_candidates
+                )
+                if max_candidates < 2:
+                    raise ValueError(
+                        "DFLASH multi-candidate mode requires "
+                        "--speculative-dflash-multi-candidate-max-candidates >= 2. "
+                        f"Got {self.speculative_dflash_multi_candidate_max_candidates}."
+                    )
+                self.speculative_dflash_multi_candidate_max_candidates = max_candidates
+
+                sample_temperature = float(
+                    self.speculative_dflash_multi_candidate_sample_temperature
+                )
+                if sample_temperature <= 0.0:
+                    raise ValueError(
+                        "DFLASH multi-candidate sample temperature must be > 0. "
+                        f"Got {self.speculative_dflash_multi_candidate_sample_temperature}."
+                    )
+                self.speculative_dflash_multi_candidate_sample_temperature = (
+                    sample_temperature
+                )
+
+                deterministic_prefix_len = int(
+                    self.speculative_dflash_multi_candidate_deterministic_prefix_len
+                )
+                if deterministic_prefix_len < 0:
+                    raise ValueError(
+                        "DFLASH multi-candidate deterministic prefix len must be >= 0. "
+                        f"Got {self.speculative_dflash_multi_candidate_deterministic_prefix_len}."
+                    )
+                self.speculative_dflash_multi_candidate_deterministic_prefix_len = (
+                    deterministic_prefix_len
+                )
+
+                verify_mode = str(
+                    self.speculative_dflash_multi_candidate_verify_mode
+                ).lower().strip()
+                if verify_mode != "packed_tree":
+                    raise ValueError(
+                        "DFLASH multi-candidate verify mode must be 'packed_tree'. "
+                        f"Got {self.speculative_dflash_multi_candidate_verify_mode!r}."
+                    )
+                self.speculative_dflash_multi_candidate_verify_mode = verify_mode
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -4937,6 +4995,43 @@ class ServerArgs:
                 "Optional verify-length buckets for grouped confidence-gate verification "
                 "(e.g., 4 8 12 16). If unset, exact per-request verify lengths are grouped."
             ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-multi-candidate",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_multi_candidate,
+            help=(
+                "DFLASH only. Enable sample-multi candidate expansion with packed-tree "
+                "target verification."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-multi-candidate-max-candidates",
+            type=int,
+            default=ServerArgs.speculative_dflash_multi_candidate_max_candidates,
+            help="DFLASH multi-candidate candidate count per request (including the greedy base path).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-multi-candidate-sample-temperature",
+            type=float,
+            default=ServerArgs.speculative_dflash_multi_candidate_sample_temperature,
+            help="Sampling temperature for non-base DFLASH multi-candidate suffix variants.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-multi-candidate-deterministic-prefix-len",
+            type=int,
+            default=ServerArgs.speculative_dflash_multi_candidate_deterministic_prefix_len,
+            help=(
+                "Keep the first N drafted suffix tokens deterministic before sampling "
+                "the remaining DFLASH multi-candidate suffix positions."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-multi-candidate-verify-mode",
+            type=str,
+            default=ServerArgs.speculative_dflash_multi_candidate_verify_mode,
+            choices=["packed_tree"],
+            help="DFLASH multi-candidate verify mode.",
         )
         parser.add_argument(
             "--speculative-dflash-cycle-trace",

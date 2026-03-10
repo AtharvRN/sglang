@@ -4,7 +4,7 @@ import random
 import time
 import copy
 from copy import deepcopy
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -325,6 +325,37 @@ class DFlashWorker:
                 False,
             )
         )
+        self._multi_candidate_enabled = bool(
+            getattr(server_args, "speculative_dflash_multi_candidate", False)
+        )
+        self._multi_candidate_max_candidates = int(
+            getattr(
+                server_args,
+                "speculative_dflash_multi_candidate_max_candidates",
+                4,
+            )
+        )
+        self._multi_candidate_sample_temperature = float(
+            getattr(
+                server_args,
+                "speculative_dflash_multi_candidate_sample_temperature",
+                1.0,
+            )
+        )
+        self._multi_candidate_deterministic_prefix_len = int(
+            getattr(
+                server_args,
+                "speculative_dflash_multi_candidate_deterministic_prefix_len",
+                0,
+            )
+        )
+        self._multi_candidate_verify_mode = str(
+            getattr(
+                server_args,
+                "speculative_dflash_multi_candidate_verify_mode",
+                "packed_tree",
+            )
+        ).lower()
         raw_group_buckets = getattr(
             server_args,
             "speculative_dflash_confidence_gate_grouped_verify_buckets",
@@ -347,6 +378,7 @@ class DFlashWorker:
         self._last_verify_positions_2d: Optional[torch.Tensor] = None
         self._last_grouped_verify_active = False
         self._last_grouped_verify_plan: list[tuple[int, list[int]]] = []
+        self._last_multi_candidate_info = None
         self._warned_grouped_verify_mamba_fallback = False
         self._adaptive_block_buckets: list[int] = []
         self._predictor_dataset_writer: Optional[PredictorDatasetShardWriter] = None
@@ -453,6 +485,14 @@ class DFlashWorker:
                     self._confidence_gate_mab_arms,
                     self._confidence_gate_grouped_verify_enabled,
                     self._confidence_gate_grouped_verify_buckets,
+                )
+            if self._multi_candidate_enabled:
+                logger.info(
+                    "DFLASH multi-candidate verify enabled. max_candidates=%d sample_temperature=%.4f deterministic_prefix_len=%d verify_mode=%s",
+                    self._multi_candidate_max_candidates,
+                    self._multi_candidate_sample_temperature,
+                    self._multi_candidate_deterministic_prefix_len,
+                    self._multi_candidate_verify_mode,
                 )
             if self._report_cycle_trace:
                 logger.info("DFLASH per-cycle trace enabled.")
@@ -2207,6 +2247,7 @@ class DFlashWorker:
             confidence_gate_decision = getattr(
                 req, "dflash_confidence_gate_last_decision", None
             )
+            multi_candidate_info = getattr(req, "dflash_multi_candidate_last_decision", None)
             trace.append(
                 {
                     "cycle_idx": int(getattr(req, "spec_verify_ct", 0)),
@@ -2223,6 +2264,7 @@ class DFlashWorker:
                     "cycle_e2e_s": per_req_cycle_e2e_s,
                     "adaptive_decision": adaptive_decision,
                     "confidence_gate_decision": confidence_gate_decision,
+                    "multi_candidate_decision": multi_candidate_info,
                 }
             )
 
@@ -2376,6 +2418,7 @@ class DFlashWorker:
             req.dflash_runtime_bs_hist = {}
             req.dflash_runtime_verify_token_hist = {}
             req.dflash_confidence_gate_last_decision = None
+            req.dflash_multi_candidate_last_decision = None
         if hasattr(req, "spec_cycle_trace"):
             req.spec_cycle_trace = None
 
@@ -2714,6 +2757,79 @@ class DFlashWorker:
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         if runtime_block_size > 1:
             draft_tokens[:, 1:].copy_(draft_next)
+
+        self._last_multi_candidate_info = None
+        if self._multi_candidate_enabled and runtime_block_size > 1:
+            if self.page_size != 1:
+                raise RuntimeError(
+                    "DFLASH multi-candidate verify currently supports only page_size=1."
+                )
+            candidate_tokens_3d, candidate_info = self._build_sample_multi_candidates(
+                base_tokens_2d=draft_tokens[:, :runtime_block_size],
+                draft_hidden=draft_hidden,
+                runtime_block_size=int(runtime_block_size),
+                lm_head=lm_head,
+            )
+            num_candidates = int(candidate_tokens_3d.shape[1])
+            candidate_positions = (
+                positions_2d[:, :runtime_block_size]
+                .unsqueeze(1)
+                .expand(bs, num_candidates, runtime_block_size)
+                .contiguous()
+            )
+            verify_input = DFlashVerifyInput(
+                draft_token=candidate_tokens_3d.reshape(-1).contiguous(),
+                positions=candidate_positions.reshape(-1).contiguous(),
+                draft_token_num=int(runtime_block_size),
+                topk=int(num_candidates),
+                num_candidates=int(num_candidates),
+                candidate_block_size=int(runtime_block_size),
+            )
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            verify_input.prepare_for_verify(
+                batch,
+                self.page_size,
+                build_custom_mask=build_custom_mask,
+            )
+
+            self._record_runtime_verify_token_usage(batch, int(runtime_block_size))
+            self._last_verify_token_num = int(runtime_block_size)
+            self._last_confidence_gate_decision = {
+                "enabled": False,
+                "selection_reason": "multi_candidate_full_verify",
+                "verify_token_num": int(runtime_block_size),
+            }
+            self._last_per_req_verify_tokens = torch.full(
+                (bs,),
+                int(runtime_block_size),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._last_draft_tokens_2d = draft_tokens[:, :runtime_block_size]
+            self._last_verify_positions_2d = positions_2d[:, :runtime_block_size]
+            self._last_grouped_verify_active = False
+            self._last_grouped_verify_plan = []
+            self._cache_predictor_cycle_features(
+                draft_hidden=draft_hidden,
+                runtime_block_size=int(runtime_block_size),
+                per_req_verify_tokens=self._last_per_req_verify_tokens,
+            )
+            self._last_multi_candidate_info = {
+                **candidate_info,
+                "candidate_tokens_3d": candidate_tokens_3d,
+                "runtime_block_size": int(runtime_block_size),
+            }
+            batch.forward_mode = (
+                ForwardMode.TARGET_VERIFY
+                if not batch.forward_mode.is_idle()
+                else ForwardMode.IDLE
+            )
+            batch.spec_info = verify_input
+            batch.return_hidden_states = False
+            return
+
         verify_token_num = int(runtime_block_size)
         confidence_gate_decision = None
         per_req_verify_tokens = torch.full(
@@ -3102,6 +3218,110 @@ class DFlashWorker:
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
         return out_token_ids, out_max_probs, out_entropies
+
+    def _compute_tp1_logits_from_lm_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        chunk_size: int = 256,
+    ) -> torch.Tensor:
+        tp_group = get_tp_group()
+        if int(tp_group.world_size) != 1:
+            raise RuntimeError(
+                "DFLASH multi-candidate sampling currently supports only TP=1."
+            )
+        if hidden_states.numel() == 0:
+            vocab_size = int(getattr(self.target_worker.model_runner.model_config, "vocab_size"))
+            return torch.empty(
+                (0, vocab_size),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+
+        logits_parts: List[torch.Tensor] = []
+        for start in range(0, int(hidden_states.shape[0]), int(chunk_size)):
+            end = min(int(hidden_states.shape[0]), start + int(chunk_size))
+            part = lm_head(hidden_states[start:end])
+            logits_parts.append(part.float())
+        return torch.cat(logits_parts, dim=0) if logits_parts else hidden_states[:0]
+
+    def _build_sample_multi_candidates(
+        self,
+        *,
+        base_tokens_2d: torch.Tensor,
+        draft_hidden: torch.Tensor,
+        runtime_block_size: int,
+        lm_head,
+    ) -> Tuple[torch.Tensor, dict]:
+        bs = int(base_tokens_2d.shape[0])
+        block_size = int(runtime_block_size)
+        max_candidates = int(max(1, self._multi_candidate_max_candidates))
+        if (
+            not self._multi_candidate_enabled
+            or max_candidates <= 1
+            or block_size <= 1
+        ):
+            return (
+                base_tokens_2d.unsqueeze(1),
+                {
+                    "enabled": False,
+                    "num_candidates": 1,
+                    "sampled_suffix_start": int(block_size),
+                },
+            )
+
+        if int(get_tp_group().world_size) != 1:
+            raise RuntimeError(
+                "DFLASH multi-candidate sampling currently supports only TP=1."
+            )
+
+        sample_start_pos = max(
+            1,
+            min(
+                block_size,
+                1 + int(self._multi_candidate_deterministic_prefix_len),
+            ),
+        )
+        num_suffix = int(max(0, block_size - sample_start_pos))
+        candidate_tokens = base_tokens_2d.unsqueeze(1).repeat(1, max_candidates, 1)
+        if num_suffix <= 0:
+            return (
+                candidate_tokens,
+                {
+                    "enabled": True,
+                    "num_candidates": int(max_candidates),
+                    "sampled_suffix_start": int(sample_start_pos),
+                },
+            )
+
+        suffix_hidden = draft_hidden[:, sample_start_pos:block_size, :].reshape(
+            bs * num_suffix, -1
+        )
+        logits = self._compute_tp1_logits_from_lm_head(
+            hidden_states=suffix_hidden,
+            lm_head=lm_head,
+        ).view(bs, num_suffix, -1)
+        probs = torch.softmax(
+            logits / float(max(self._multi_candidate_sample_temperature, 1e-6)),
+            dim=-1,
+        )
+        probs = probs.reshape(bs * num_suffix, -1)
+
+        extra = int(max_candidates - 1)
+        samples = torch.multinomial(
+            probs.repeat_interleave(extra, dim=0),
+            num_samples=1,
+        ).view(bs, extra, num_suffix)
+        candidate_tokens[:, 1:, sample_start_pos:block_size] = samples
+        return (
+            candidate_tokens,
+            {
+                "enabled": True,
+                "num_candidates": int(max_candidates),
+                "sampled_suffix_start": int(sample_start_pos),
+            },
+        )
 
     def _append_target_hidden_to_draft_kv(
         self,
@@ -3593,6 +3813,19 @@ class DFlashWorker:
             )
             for req in batch.reqs:
                 req.dflash_confidence_gate_last_decision = self._last_confidence_gate_decision
+        multi_candidate_info = getattr(self, "_last_multi_candidate_info", None)
+        multi_candidate_summary = None
+        if isinstance(multi_candidate_info, dict) and multi_candidate_info.get("enabled", False):
+            multi_candidate_summary = {
+                "enabled": True,
+                "num_candidates": int(multi_candidate_info.get("num_candidates", 1)),
+                "sampled_suffix_start": int(
+                    multi_candidate_info.get("sampled_suffix_start", runtime_bs)
+                ),
+                "verify_mode": str(self._multi_candidate_verify_mode),
+            }
+        for req in batch.reqs:
+            req.dflash_multi_candidate_last_decision = multi_candidate_summary
         if self._adaptive_block_size_enabled:
             for req, accepted_draft_tokens in self._iter_req_value_pairs(
                 batch.reqs, accept_length_per_req_cpu, tag="adaptive_update"
