@@ -3219,32 +3219,85 @@ class DFlashWorker:
 
         return out_token_ids, out_max_probs, out_entropies
 
-    def _compute_tp1_logits_from_lm_head(
+    def _compute_tp1_valid_logits_from_lm_head(
         self,
         *,
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         tp_group = get_tp_group()
         if int(tp_group.world_size) != 1:
             raise RuntimeError(
                 "DFLASH multi-candidate sampling currently supports only TP=1."
             )
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH multi-candidate sampling requires a vocab-parallel head "
+                "with `weight` and `shard_indices`."
+            )
+
+        shard = lm_head.shard_indices
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        valid_id_parts: List[torch.Tensor] = []
+        if num_org > 0:
+            valid_id_parts.append(
+                torch.arange(
+                    org_vocab_start,
+                    org_vocab_start + num_org,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+            )
+        if num_added > 0:
+            valid_id_parts.append(
+                torch.arange(
+                    added_vocab_start,
+                    added_vocab_start + num_added,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+            )
+        valid_token_ids = (
+            torch.cat(valid_id_parts, dim=0)
+            if valid_id_parts
+            else torch.empty((0,), device=hidden_states.device, dtype=torch.long)
+        )
         if hidden_states.numel() == 0:
-            vocab_size = int(getattr(self.target_worker.model_runner.model_config, "vocab_size"))
             return torch.empty(
-                (0, vocab_size),
+                (0, int(valid_token_ids.shape[0])),
                 dtype=torch.float32,
                 device=hidden_states.device,
-            )
+            ), valid_token_ids
 
         logits_parts: List[torch.Tensor] = []
         for start in range(0, int(hidden_states.shape[0]), int(chunk_size)):
             end = min(int(hidden_states.shape[0]), start + int(chunk_size))
-            part = lm_head(hidden_states[start:end])
-            logits_parts.append(part.float())
-        return torch.cat(logits_parts, dim=0) if logits_parts else hidden_states[:0]
+            hs = hidden_states[start:end]
+            if hs.dtype != weight_dtype:
+                hs = hs.to(weight_dtype)
+            part_logits: List[torch.Tensor] = []
+            if num_org > 0:
+                part_logits.append(torch.matmul(hs, weight[:num_org].T))
+            if num_added > 0:
+                part_logits.append(
+                    torch.matmul(
+                        hs,
+                        weight[num_org_padded : num_org_padded + num_added].T,
+                    )
+                )
+            logits_parts.append(torch.cat(part_logits, dim=-1).float())
+        return (
+            torch.cat(logits_parts, dim=0) if logits_parts else hidden_states[:0],
+            valid_token_ids,
+        )
 
     def _build_sample_multi_candidates(
         self,
@@ -3298,10 +3351,11 @@ class DFlashWorker:
         suffix_hidden = draft_hidden[:, sample_start_pos:block_size, :].reshape(
             bs * num_suffix, -1
         )
-        logits = self._compute_tp1_logits_from_lm_head(
+        logits, valid_token_ids = self._compute_tp1_valid_logits_from_lm_head(
             hidden_states=suffix_hidden,
             lm_head=lm_head,
-        ).view(bs, num_suffix, -1)
+        )
+        logits = logits.view(bs, num_suffix, -1)
         probs = torch.softmax(
             logits / float(max(self._multi_candidate_sample_temperature, 1e-6)),
             dim=-1,
@@ -3309,10 +3363,11 @@ class DFlashWorker:
         probs = probs.reshape(bs * num_suffix, -1)
 
         extra = int(max_candidates - 1)
-        samples = torch.multinomial(
+        sample_index = torch.multinomial(
             probs.repeat_interleave(extra, dim=0),
             num_samples=1,
-        ).view(bs, extra, num_suffix)
+        ).view(bs, num_suffix, extra)
+        samples = valid_token_ids[sample_index].transpose(1, 2).contiguous()
         candidate_tokens[:, 1:, sample_start_pos:block_size] = samples
         return (
             candidate_tokens,
