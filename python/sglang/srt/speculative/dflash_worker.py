@@ -2213,6 +2213,7 @@ class DFlashWorker:
             return
 
         proposed_draft_tokens = max(0, int(runtime_block_size) - 1)
+        multi_candidate_global = getattr(self, "_last_multi_candidate_info", None)
         per_req_draft_time_s = (
             float(self._last_draft_time_s) / float(len(batch.reqs))
             if self._report_timing and self._last_draft_time_s > 0.0
@@ -2248,6 +2249,32 @@ class DFlashWorker:
                 req, "dflash_confidence_gate_last_decision", None
             )
             multi_candidate_info = getattr(req, "dflash_multi_candidate_last_decision", None)
+            if (
+                isinstance(multi_candidate_info, dict)
+                and multi_candidate_info.get("enabled", False)
+                and isinstance(multi_candidate_global, dict)
+            ):
+                multi_candidate_info = {
+                    **multi_candidate_info,
+                    "candidate_block_size": int(
+                        multi_candidate_global.get(
+                            "candidate_block_size", runtime_block_size
+                        )
+                    ),
+                    "effective_verify_tokens_per_req": int(
+                        multi_candidate_global.get(
+                            "effective_verify_tokens_per_req",
+                            runtime_block_size
+                            * int(multi_candidate_info.get("num_candidates", 1)),
+                        )
+                    ),
+                    "verify_mask_backend": multi_candidate_global.get(
+                        "verify_mask_backend"
+                    ),
+                    "build_custom_mask": multi_candidate_global.get(
+                        "build_custom_mask"
+                    ),
+                }
             trace.append(
                 {
                     "cycle_idx": int(getattr(req, "spec_verify_ct", 0)),
@@ -2785,7 +2812,7 @@ class DFlashWorker:
                 num_candidates=int(num_candidates),
                 candidate_block_size=int(runtime_block_size),
             )
-            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+            verify_mask_backend, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
             verify_input.prepare_for_verify(
@@ -2820,6 +2847,12 @@ class DFlashWorker:
                 **candidate_info,
                 "candidate_tokens_3d": candidate_tokens_3d,
                 "runtime_block_size": int(runtime_block_size),
+                "candidate_block_size": int(runtime_block_size),
+                "effective_verify_tokens_per_req": int(
+                    runtime_block_size * num_candidates
+                ),
+                "verify_mask_backend": str(verify_mask_backend),
+                "build_custom_mask": bool(build_custom_mask),
             }
             batch.forward_mode = (
                 ForwardMode.TARGET_VERIFY
@@ -3874,9 +3907,21 @@ class DFlashWorker:
             multi_candidate_summary = {
                 "enabled": True,
                 "num_candidates": int(multi_candidate_info.get("num_candidates", 1)),
+                "candidate_block_size": int(
+                    multi_candidate_info.get("candidate_block_size", runtime_bs)
+                ),
+                "effective_verify_tokens_per_req": int(
+                    multi_candidate_info.get(
+                        "effective_verify_tokens_per_req",
+                        runtime_bs
+                        * int(multi_candidate_info.get("num_candidates", 1)),
+                    )
+                ),
                 "sampled_suffix_start": int(
                     multi_candidate_info.get("sampled_suffix_start", runtime_bs)
                 ),
+                "verify_mask_backend": multi_candidate_info.get("verify_mask_backend"),
+                "build_custom_mask": multi_candidate_info.get("build_custom_mask"),
                 "verify_mode": str(self._multi_candidate_verify_mode),
             }
         for req in batch.reqs:
