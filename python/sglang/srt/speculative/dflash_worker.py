@@ -3404,11 +3404,43 @@ class DFlashWorker:
         ).view(bs, num_suffix, extra)
         samples = valid_token_ids[sample_index].transpose(1, 2).contiguous()
         candidate_tokens[:, 1:, sample_start_pos:block_size] = samples
+        unique_counts: List[int] = []
+        unique_candidates_per_req: List[List[torch.Tensor]] = []
+        for req_idx in range(bs):
+            unique_req: List[torch.Tensor] = []
+            for cand_idx in range(max_candidates):
+                cand = candidate_tokens[req_idx, cand_idx]
+                if not any(torch.equal(cand, prev) for prev in unique_req):
+                    unique_req.append(cand)
+            unique_candidates_per_req.append(unique_req)
+            unique_counts.append(len(unique_req))
+
+        effective_candidates = int(max(unique_counts)) if unique_counts else 1
+        if effective_candidates < max_candidates:
+            deduped = candidate_tokens[:, :effective_candidates, :].clone()
+            for req_idx, unique_req in enumerate(unique_candidates_per_req):
+                for cand_idx, cand in enumerate(unique_req[:effective_candidates]):
+                    deduped[req_idx, cand_idx].copy_(cand)
+                pad_src = unique_req[0] if unique_req else candidate_tokens[req_idx, 0]
+                for cand_idx in range(len(unique_req), effective_candidates):
+                    deduped[req_idx, cand_idx].copy_(pad_src)
+            candidate_tokens = deduped
+
         return (
             candidate_tokens,
             {
                 "enabled": True,
-                "num_candidates": int(max_candidates),
+                "num_candidates": int(candidate_tokens.shape[1]),
+                "requested_num_candidates": int(max_candidates),
+                "unique_candidate_count_min": int(min(unique_counts))
+                if unique_counts
+                else 1,
+                "unique_candidate_count_max": int(max(unique_counts))
+                if unique_counts
+                else 1,
+                "unique_candidate_count_avg": float(sum(unique_counts) / len(unique_counts))
+                if unique_counts
+                else 1.0,
                 "sampled_suffix_start": int(sample_start_pos),
             },
         )
@@ -3910,6 +3942,21 @@ class DFlashWorker:
             multi_candidate_summary = {
                 "enabled": True,
                 "num_candidates": int(multi_candidate_info.get("num_candidates", 1)),
+                "requested_num_candidates": int(
+                    multi_candidate_info.get(
+                        "requested_num_candidates",
+                        multi_candidate_info.get("num_candidates", 1),
+                    )
+                ),
+                "unique_candidate_count_min": int(
+                    multi_candidate_info.get("unique_candidate_count_min", 1)
+                ),
+                "unique_candidate_count_max": int(
+                    multi_candidate_info.get("unique_candidate_count_max", 1)
+                ),
+                "unique_candidate_count_avg": float(
+                    multi_candidate_info.get("unique_candidate_count_avg", 1.0)
+                ),
                 "candidate_block_size": int(
                     multi_candidate_info.get("candidate_block_size", runtime_bs)
                 ),
