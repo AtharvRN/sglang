@@ -505,7 +505,9 @@ class ServerArgs:
     speculative_dflash_adaptive_high_accept_streak: int = 2
     speculative_dflash_adaptive_cooldown_cycles: int = 1
     speculative_dflash_confidence_gate: bool = False
-    speculative_dflash_confidence_gate_mode: Literal["threshold", "score"] = "threshold"
+    speculative_dflash_confidence_gate_mode: Literal[
+        "threshold", "score", "predictor"
+    ] = "threshold"
     speculative_dflash_confidence_threshold: float = 0.20
     speculative_dflash_confidence_gate_score_metric: Literal[
         "neg_log_max_prob", "entropy"
@@ -534,6 +536,7 @@ class ServerArgs:
         Literal["triton"]
     ] = None
     speculative_dflash_cycle_trace: bool = False
+    speculative_dflash_predictor_model_path: Optional[str] = None
     speculative_dflash_predictor_dataset_output_dir: Optional[str] = None
     speculative_dflash_predictor_dataset_shard_rows: int = 100000
     speculative_accept_threshold_single: float = 1.0
@@ -2798,14 +2801,14 @@ class ServerArgs:
                 conf_mode = str(
                     self.speculative_dflash_confidence_gate_mode
                 ).lower().strip()
-                if conf_mode not in ("threshold", "score"):
+                if conf_mode not in ("threshold", "score", "predictor"):
                     raise ValueError(
-                        "DFLASH confidence gate mode must be one of {threshold, score}. "
+                        "DFLASH confidence gate mode must be one of {threshold, score, predictor}. "
                         f"Got {self.speculative_dflash_confidence_gate_mode!r}."
                     )
                 self.speculative_dflash_confidence_gate_mode = conf_mode
 
-                if conf_mode == "threshold" or self.speculative_dflash_confidence_gate_mab:
+                if conf_mode in ("threshold", "predictor") or self.speculative_dflash_confidence_gate_mab:
                     conf_threshold = float(self.speculative_dflash_confidence_threshold)
                     if not (0.0 < conf_threshold < 1.0):
                         raise ValueError(
@@ -2860,6 +2863,24 @@ class ServerArgs:
                         f"Got {self.speculative_dflash_confidence_gate_aggregate!r}."
                     )
                 self.speculative_dflash_confidence_gate_aggregate = conf_agg
+
+                predictor_model_path = self.speculative_dflash_predictor_model_path
+                if predictor_model_path is not None:
+                    predictor_model_path = str(predictor_model_path).strip()
+                    if not predictor_model_path:
+                        raise ValueError(
+                            "DFLASH predictor model path must be a non-empty path."
+                        )
+                    self.speculative_dflash_predictor_model_path = predictor_model_path
+                else:
+                    self.speculative_dflash_predictor_model_path = None
+
+                if conf_mode == "predictor":
+                    if self.speculative_dflash_predictor_model_path is None:
+                        raise ValueError(
+                            "DFLASH predictor confidence-gate mode requires "
+                            "--speculative-dflash-predictor-model-path."
+                        )
 
                 min_verify_tokens = int(
                     self.speculative_dflash_confidence_gate_min_verify_tokens
@@ -4932,11 +4953,12 @@ class ServerArgs:
             "--speculative-dflash-confidence-gate-mode",
             type=str,
             default=ServerArgs.speculative_dflash_confidence_gate_mode,
-            choices=["threshold", "score"],
+            choices=["threshold", "score", "predictor"],
             help=(
                 "DFLASH confidence-gate mode. "
                 "'threshold' verifies until the first low-confidence token. "
-                "'score' verifies the longest prefix whose cumulative score stays within a budget."
+                "'score' verifies the longest prefix whose cumulative score stays within a budget. "
+                "'predictor' uses a trained accept-probability head over draft hidden states."
             ),
         )
         parser.add_argument(
@@ -5091,6 +5113,15 @@ class ServerArgs:
             help=(
                 "DFLASH only. Emit per-request per-cycle trace in response meta_info "
                 "(accept length, runtime block size, and attributed draft/verify timings)."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-predictor-model-path",
+            type=str,
+            default=ServerArgs.speculative_dflash_predictor_model_path,
+            help=(
+                "DFLASH only. Path to a trained per-token accept predictor checkpoint. "
+                "Required for --speculative-dflash-confidence-gate-mode predictor."
             ),
         )
         parser.add_argument(

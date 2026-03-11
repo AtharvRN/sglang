@@ -25,6 +25,10 @@ from sglang.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     finalize_dense_multi_candidate_verify,
 )
+from sglang.srt.speculative.dflash_predictor import (
+    LoadedDFlashPredictor,
+    load_dflash_accept_predictor,
+)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     is_dflash_sampling_verify_available,
@@ -388,6 +392,7 @@ class DFlashWorker:
         self._warned_grouped_verify_mamba_fallback = False
         self._adaptive_block_buckets: list[int] = []
         self._predictor_dataset_writer: Optional[PredictorDatasetShardWriter] = None
+        self._accept_predictor: Optional[LoadedDFlashPredictor] = None
         self._last_predictor_draft_hidden_3d: Optional[torch.Tensor] = None
         self._last_predictor_verify_tokens_by_req: Optional[list[int]] = None
         if self._adaptive_block_size_enabled:
@@ -400,6 +405,16 @@ class DFlashWorker:
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        predictor_model_path = getattr(
+            server_args,
+            "speculative_dflash_predictor_model_path",
+            None,
+        )
+        if predictor_model_path:
+            self._accept_predictor = load_dflash_accept_predictor(
+                checkpoint_path=str(predictor_model_path),
+                device=self.device,
+            )
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
@@ -513,6 +528,14 @@ class DFlashWorker:
                 "speculative_dflash_predictor_dataset_output_dir",
                 None,
             )
+            if self._accept_predictor is not None:
+                logger.info(
+                    "DFLASH predictor checkpoint loaded. path=%s input_dim=%d hidden_dim=%d dropout=%.4f",
+                    self._accept_predictor.checkpoint_path,
+                    self._accept_predictor.input_dim,
+                    self._accept_predictor.hidden_dim,
+                    self._accept_predictor.dropout,
+                )
             if predictor_output_dir:
                 shard_rows = int(
                     getattr(
@@ -697,8 +720,14 @@ class DFlashWorker:
         *,
         draft_max_probs: Optional[torch.Tensor],
         draft_entropies: Optional[torch.Tensor],
+        draft_hidden: Optional[torch.Tensor],
         runtime_block_size: int,
     ) -> tuple[int, dict, torch.Tensor]:
+        if self._confidence_gate_mode == "predictor":
+            return self._compute_predictor_gated_verify_tokens(
+                draft_hidden=draft_hidden,
+                runtime_block_size=runtime_block_size,
+            )
         if self._confidence_gate_mode == "score":
             return self._compute_score_gated_verify_tokens(
                 draft_max_probs=draft_max_probs,
@@ -709,6 +738,127 @@ class DFlashWorker:
             draft_max_probs=draft_max_probs,
             runtime_block_size=runtime_block_size,
         )
+
+    def _predictor_accept_probs(
+        self,
+        *,
+        draft_hidden: Optional[torch.Tensor],
+        runtime_block_size: int,
+    ) -> Optional[torch.Tensor]:
+        if self._accept_predictor is None or draft_hidden is None:
+            return None
+        if int(runtime_block_size) <= 1:
+            return None
+
+        token_hidden = draft_hidden[:, 1:int(runtime_block_size), :]
+        if token_hidden.numel() == 0:
+            return None
+
+        bs = int(token_hidden.shape[0])
+        proposed = int(token_hidden.shape[1])
+        token_hidden = token_hidden.to(dtype=torch.float32)
+        draft_pos = torch.arange(
+            1,
+            proposed + 1,
+            device=token_hidden.device,
+            dtype=torch.float32,
+        ).view(1, proposed, 1)
+        draft_pos = draft_pos.expand(bs, proposed, 1)
+        pos_norm = draft_pos / float(max(int(runtime_block_size), 1))
+        bs_norm = torch.full(
+            (bs, proposed, 1),
+            float(runtime_block_size) / float(max(int(self.block_size), 1)),
+            device=token_hidden.device,
+            dtype=torch.float32,
+        )
+        features = torch.cat(
+            [
+                token_hidden,
+                draft_pos / 16.0,
+                pos_norm,
+                bs_norm,
+            ],
+            dim=2,
+        )
+        if int(features.shape[2]) != int(self._accept_predictor.input_dim):
+            raise RuntimeError(
+                "DFLASH predictor feature dimension mismatch. "
+                f"expected={self._accept_predictor.input_dim} got={features.shape[2]}."
+            )
+        with torch.inference_mode():
+            logits = self._accept_predictor.model(
+                features.reshape(bs * proposed, int(features.shape[2]))
+            )
+            probs = torch.sigmoid(logits).reshape(bs, proposed)
+        return probs
+
+    def _compute_predictor_gated_verify_tokens(
+        self,
+        *,
+        draft_hidden: Optional[torch.Tensor],
+        runtime_block_size: int,
+    ) -> tuple[int, dict, torch.Tensor]:
+        if self._accept_predictor is None:
+            raise RuntimeError(
+                "DFLASH predictor confidence-gate mode requires a loaded predictor checkpoint."
+            )
+        if draft_hidden is None:
+            raise RuntimeError(
+                "DFLASH predictor confidence-gate mode requires draft hidden states."
+            )
+
+        accept_probs = self._predictor_accept_probs(
+            draft_hidden=draft_hidden,
+            runtime_block_size=runtime_block_size,
+        )
+        bs = int(draft_hidden.shape[0])
+        per_req_verify_tokens = torch.full(
+            (bs,),
+            int(runtime_block_size),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        threshold = float(self._confidence_gate_threshold)
+        if accept_probs is not None and accept_probs.numel() > 0:
+            below = accept_probs < float(threshold)
+            has_below = torch.any(below, dim=1)
+            first_idx = torch.argmax(below.to(torch.int32), dim=1) + 1
+            per_req_verify_tokens = torch.where(
+                has_below,
+                first_idx.to(torch.int32),
+                per_req_verify_tokens,
+            )
+
+        per_req_verify_tokens = torch.clamp(
+            per_req_verify_tokens,
+            min=int(self._confidence_gate_min_verify_tokens),
+            max=int(runtime_block_size),
+        )
+        verify_token_num = self._aggregate_confidence_gate_verify_tokens(
+            per_req_verify_tokens=per_req_verify_tokens,
+            runtime_block_size=int(runtime_block_size),
+        )
+
+        decision = {
+            "enabled": True,
+            "mode": "predictor",
+            "threshold": float(threshold),
+            "selection_reason": "predictor_threshold",
+            "aggregate": str(self._confidence_gate_aggregate),
+            "min_verify_tokens": int(self._confidence_gate_min_verify_tokens),
+            "runtime_block_size": int(runtime_block_size),
+            "verify_token_num": int(verify_token_num),
+            "per_req_verify_tokens": [int(v) for v in per_req_verify_tokens.tolist()],
+            "per_req_mean_accept_prob": (
+                [float(v) for v in accept_probs.mean(dim=1).tolist()]
+                if accept_probs is not None and accept_probs.numel() > 0
+                else []
+            ),
+            "predictor_model_path": str(self._accept_predictor.checkpoint_path),
+            "predictor_input_dim": int(self._accept_predictor.input_dim),
+            "predictor_hidden_dim": int(self._accept_predictor.hidden_dim),
+        }
+        return int(verify_token_num), decision, per_req_verify_tokens
 
     def _compute_threshold_gated_verify_tokens(
         self,
@@ -3189,6 +3339,7 @@ class DFlashWorker:
                 self._compute_confidence_gated_verify_tokens(
                     draft_max_probs=draft_next_max_probs,
                     draft_entropies=draft_next_entropies,
+                    draft_hidden=draft_hidden,
                     runtime_block_size=int(runtime_block_size),
                 )
             )
