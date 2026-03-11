@@ -1153,19 +1153,31 @@ class DFlashWorker:
         batch: ScheduleBatch,
         num_candidates: int,
         temp_req_pool_indices: torch.Tensor,
-    ) -> ScheduleBatch:
+        ) -> ScheduleBatch:
         """Build a temporary batch with one independent verify row per candidate."""
 
         bs = batch.batch_size()
+        repeat_factor = int(num_candidates)
         parent_rows_device = torch.arange(
             bs, device=self.device, dtype=torch.int64
-        ).repeat_interleave(int(num_candidates))
+        ).repeat_interleave(repeat_factor)
         parent_rows_cpu = parent_rows_device.tolist()
         candidate_rows_cpu = (
-            torch.arange(int(num_candidates), device=self.device, dtype=torch.int64)
+            torch.arange(repeat_factor, device=self.device, dtype=torch.int64)
             .repeat(bs)
             .tolist()
         )
+
+        def _scale_global_token_counts(
+            counts: Optional[list[int]],
+        ) -> Optional[list[int]]:
+            if counts is None:
+                return None
+            # The parent batch accounts for one speculative row per live request.
+            # Dense verify expands each live request into `num_candidates`
+            # independent verify rows, so downstream token-count metadata must
+            # reflect the larger logical batch as well.
+            return [int(v) * repeat_factor for v in counts]
 
         sub_reqs = []
         for row_idx, (parent_idx, candidate_idx) in enumerate(
@@ -1273,6 +1285,13 @@ class DFlashWorker:
 
         sub_batch.has_stream = any(req.stream for req in sub_batch.reqs)
         sub_batch.has_grammar = any(req.grammar for req in sub_batch.reqs)
+        sub_batch.decoding_reqs = sub_reqs
+        sub_batch.global_num_tokens = _scale_global_token_counts(
+            batch.global_num_tokens
+        )
+        sub_batch.global_num_tokens_for_logprob = _scale_global_token_counts(
+            batch.global_num_tokens_for_logprob
+        )
 
         if batch.sampling_info is not None:
             sub_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
