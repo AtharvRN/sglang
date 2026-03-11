@@ -281,6 +281,243 @@ def build_dflash_verify_allow_mask_batched(
     return dense_mask[valid_cols.expand(bs, q_len, valid_cols.shape[-1])].contiguous()
 
 
+def finalize_dense_multi_candidate_verify(
+    *,
+    batch: ScheduleBatch,
+    candidate_tokens_3d: torch.Tensor,
+    candidate_out_cache_loc: torch.Tensor,
+    logits_output: LogitsProcessorOutput,
+    page_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+    """Finalize a true dense batched multi-candidate verify run.
+
+    Each candidate is verified as an independent batch row with standard causal
+    attention. This function then selects the winning candidate per original
+    request and commits only the chosen branch back into the live request state.
+    """
+
+    if page_size != 1:
+        raise RuntimeError(
+            "DFLASH dense batched multi-candidate verify currently supports only page_size=1."
+        )
+
+    if candidate_tokens_3d.dim() != 3:
+        raise ValueError(
+            "candidate_tokens_3d must have shape [bs, num_candidates, block_len]."
+        )
+
+    bs = batch.batch_size()
+    device = logits_output.next_token_logits.device
+    if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
+        raise RuntimeError(
+            "DFLASH dense batched multi-candidate verify currently supports only greedy target verification."
+        )
+
+    if int(candidate_tokens_3d.shape[0]) != bs:
+        raise ValueError(
+            f"candidate_tokens_3d batch size mismatch: {candidate_tokens_3d.shape[0]} vs {bs}."
+        )
+
+    num_candidates = int(candidate_tokens_3d.shape[1])
+    block_len = int(candidate_tokens_3d.shape[2])
+    if num_candidates <= 1:
+        raise ValueError(
+            "Dense multi-candidate finalize expects num_candidates > 1."
+        )
+
+    target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+        bs, num_candidates, block_len
+    )
+    if block_len <= 1:
+        accept_len = torch.zeros((bs, num_candidates), dtype=torch.int64, device=device)
+    else:
+        accept_len = (
+            candidate_tokens_3d[:, :, 1:]
+            .eq(target_predict[:, :, :-1])
+            .cumprod(dim=2)
+            .sum(dim=2)
+        )
+    tau = accept_len + 1
+    candidate_idx = torch.arange(
+        num_candidates, dtype=torch.int64, device=device
+    ).unsqueeze(0)
+    score = tau.to(torch.int64) * int(num_candidates + 1) - candidate_idx
+    chosen_candidate_idx = torch.argmax(score, dim=1)
+    chosen_tau = tau.gather(1, chosen_candidate_idx.unsqueeze(1)).squeeze(1)
+    next_tokens_all = target_predict.gather(2, accept_len.unsqueeze(-1)).squeeze(-1)
+    chosen_next_token = next_tokens_all.gather(
+        1, chosen_candidate_idx.unsqueeze(1)
+    ).squeeze(1)
+    chosen_tokens = candidate_tokens_3d[
+        torch.arange(bs, dtype=torch.int64, device=device), chosen_candidate_idx
+    ]
+
+    packed_choice = torch.cat(
+        [
+            chosen_tokens.to(torch.int64),
+            chosen_next_token.unsqueeze(1).to(torch.int64),
+            chosen_tau.unsqueeze(1).to(torch.int64),
+        ],
+        dim=1,
+    ).cpu()
+    chosen_candidate_idx_cpu = chosen_candidate_idx.to(torch.int64).cpu()
+
+    hidden = logits_output.hidden_states
+    if hidden is None:
+        raise RuntimeError(
+            "DFLASH dense batched multi-candidate verify requires target hidden states, but got None."
+        )
+    hidden = hidden.view(bs, num_candidates, block_len, -1)
+    hidden_feature_dim = int(hidden.shape[-1])
+    out_cache_loc = candidate_out_cache_loc.view(bs, num_candidates, block_len)
+
+    free_segments: List[torch.Tensor] = []
+    kept_segments: List[torch.Tensor] = []
+    target_hidden_segments: List[torch.Tensor] = []
+    commit_lens_cpu: List[int] = []
+    accept_length_per_req_cpu: List[int] = []
+    new_verified_list: List[int] = []
+
+    for i, req in enumerate(batch.reqs):
+        chosen_idx = int(chosen_candidate_idx_cpu[i].item())
+        acc_len = int(packed_choice[i, block_len + 1].item()) - 1
+        chosen_tokens_cpu = packed_choice[i, :block_len]
+        proposed = chosen_tokens_cpu[1 : 1 + acc_len].tolist() + [
+            int(packed_choice[i, block_len].item())
+        ]
+
+        appended = 0
+        if (
+            req.grammar is None
+            and not req.sampling_params.stop_strs
+            and not req.sampling_params.stop_regex_strs
+        ):
+            remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
+            if remaining > 0:
+                tokens = proposed[:remaining]
+                if not req.sampling_params.ignore_eos:
+                    stop_token_ids = req.sampling_params.stop_token_ids
+                    eos_token_ids = req.eos_token_ids
+                    tokenizer = req.tokenizer
+                    tokenizer_eos = (
+                        tokenizer.eos_token_id if tokenizer is not None else None
+                    )
+                    additional_stop = (
+                        tokenizer.additional_stop_token_ids
+                        if tokenizer is not None
+                        else None
+                    )
+                    vocab_size = getattr(req, "vocab_size", None)
+
+                    for j, token_id in enumerate(tokens):
+                        if vocab_size is not None and (
+                            int(token_id) > int(vocab_size) or int(token_id) < 0
+                        ):
+                            tokens = tokens[: j + 1]
+                            break
+                        if stop_token_ids and token_id in stop_token_ids:
+                            tokens = tokens[: j + 1]
+                            break
+                        if eos_token_ids and token_id in eos_token_ids:
+                            tokens = tokens[: j + 1]
+                            break
+                        if tokenizer_eos is not None and int(token_id) == int(
+                            tokenizer_eos
+                        ):
+                            tokens = tokens[: j + 1]
+                            break
+                        if additional_stop and token_id in additional_stop:
+                            tokens = tokens[: j + 1]
+                            break
+
+                req.output_ids.extend(int(tok) for tok in tokens)
+                appended = len(tokens)
+                if appended > 0:
+                    req.check_finished(new_accepted_len=appended)
+        else:
+            for tok in proposed:
+                req.output_ids.append(int(tok))
+                appended += 1
+                req.check_finished()
+                if req.finished():
+                    break
+                if req.grammar is not None:
+                    req.grammar.accept_token(int(tok))
+
+        if req.output_ids:
+            new_verified_token = int(req.output_ids[-1])
+        elif req.origin_input_ids:
+            new_verified_token = int(req.origin_input_ids[-1])
+        else:
+            raise RuntimeError(
+                "DFLASH dense batched verify cannot determine current token: both output_ids and origin_input_ids are empty."
+            )
+
+        commit_lens_cpu.append(appended)
+        new_verified_list.append(new_verified_token)
+        accept_length_per_req_cpu.append(max(0, appended - 1))
+        req.spec_verify_ct += 1
+        req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+        req.spec_draft_token_num += max(0, int(block_len) - 1)
+
+        keep = out_cache_loc[i, chosen_idx, :appended]
+        kept_segments.append(keep)
+        if appended > 0:
+            target_hidden_segments.append(hidden[i, chosen_idx, :appended, :])
+
+        free_req = []
+        if chosen_idx > 0:
+            free_req.append(out_cache_loc[i, :chosen_idx, :].reshape(-1))
+        if chosen_idx + 1 < num_candidates:
+            free_req.append(out_cache_loc[i, chosen_idx + 1 :, :].reshape(-1))
+        if appended < block_len:
+            free_req.append(out_cache_loc[i, chosen_idx, appended:block_len])
+        if free_req:
+            free_segments.append(torch.cat(free_req, dim=0))
+
+    if free_segments:
+        batch.token_to_kv_pool_allocator.free(torch.cat(free_segments, dim=0))
+    batch.out_cache_loc = (
+        torch.cat(kept_segments, dim=0) if kept_segments else batch.out_cache_loc[:0]
+    )
+
+    commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+    new_verified_id = torch.tensor(new_verified_list, dtype=torch.int64, device=device)
+
+    for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
+        req.kv_committed_len += commit_len
+        req.kv_allocated_len = req.kv_committed_len
+
+    end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+    assign_req_to_token_pool_func(
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        batch.seq_lens,
+        end_offset,
+        batch.out_cache_loc,
+        bs,
+    )
+
+    batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+    batch.seq_lens_cpu.add_(
+        torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+    )
+    batch.seq_lens_sum += sum(commit_lens_cpu)
+
+    next_target_hidden = (
+        torch.cat(target_hidden_segments, dim=0)
+        if target_hidden_segments
+        else torch.empty((0, hidden_feature_dim), dtype=hidden.dtype, device=device)
+    )
+    logits_output.hidden_states = None
+    return (
+        new_verified_id,
+        commit_lens,
+        next_target_hidden,
+        accept_length_per_req_cpu,
+    )
+
+
 @dataclass
 class DFlashDraftInput(SpecInput):
     """Per-batch DFlash draft state for spec-v1 (non-overlap) scheduling.
