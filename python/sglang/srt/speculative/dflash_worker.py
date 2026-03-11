@@ -797,12 +797,12 @@ class DFlashWorker:
         )
         threshold = float(self._confidence_gate_threshold)
         if accept_probs is not None and accept_probs.numel() > 0:
-            prefix_accept_probs = torch.cumprod(
-                torch.clamp(accept_probs.to(dtype=torch.float32), min=1e-6, max=1.0),
-                dim=1,
+            prefix_survival_probs = torch.clamp(
+                accept_probs.to(dtype=torch.float32),
+                min=1e-6,
+                max=1.0,
             )
-            prefix_reject_probs = 1.0 - prefix_accept_probs
-            below = prefix_reject_probs > float(threshold)
+            below = prefix_survival_probs < float(threshold)
             has_below = torch.any(below, dim=1)
             first_idx = torch.argmax(below.to(torch.int32), dim=1) + 1
             per_req_verify_tokens = torch.where(
@@ -825,19 +825,20 @@ class DFlashWorker:
             "enabled": True,
             "mode": "predictor",
             "threshold": float(threshold),
-            "selection_reason": "predictor_cumulative_reject_threshold",
+            "selection_reason": "predictor_prefix_survival_threshold",
             "aggregate": str(self._confidence_gate_aggregate),
             "min_verify_tokens": int(self._confidence_gate_min_verify_tokens),
             "runtime_block_size": int(runtime_block_size),
             "verify_token_num": int(verify_token_num),
             "per_req_verify_tokens": [int(v) for v in per_req_verify_tokens.tolist()],
-            "per_req_stop_prob": (
+            "per_req_min_prefix_survival_prob": (
                 [
                     float(v)
-                    for v in (1.0 - torch.cumprod(
-                        torch.clamp(accept_probs.to(dtype=torch.float32), min=1e-6, max=1.0),
-                        dim=1,
-                    )).amax(dim=1).values.tolist()
+                    for v in torch.clamp(
+                        accept_probs.to(dtype=torch.float32),
+                        min=1e-6,
+                        max=1.0,
+                    ).amin(dim=1).tolist()
                 ]
                 if accept_probs is not None and accept_probs.numel() > 0
                 else []
