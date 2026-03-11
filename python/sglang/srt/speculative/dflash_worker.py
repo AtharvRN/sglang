@@ -3042,131 +3042,139 @@ class DFlashWorker:
             sampled_suffix_start = int(
                 candidate_info.get("sampled_suffix_start", runtime_block_size)
             )
-            verify_mode = str(self._multi_candidate_verify_mode).lower().strip()
-            if verify_mode not in {"packed_tree", "batched"}:
-                raise RuntimeError(
-                    "Unsupported DFLASH multi-candidate verify mode "
-                    f"{self._multi_candidate_verify_mode!r}."
-                )
-            shared_prefix_len = int(
-                max(
-                    0,
-                    min(
-                        int(runtime_block_size),
-                        int(candidate_info.get("shared_prefix_len", sampled_suffix_start)),
-                    ),
-                )
-            )
-            compact_tree = bool(
-                verify_mode == "packed_tree"
-                and num_candidates > 1
-                and 0 < shared_prefix_len < int(runtime_block_size)
-            )
-            verify_input = None
-            if verify_mode == "packed_tree":
-                if compact_tree:
-                    suffix_len = int(runtime_block_size - shared_prefix_len)
-                    shared_tokens_2d = candidate_tokens_3d[:, 0, :shared_prefix_len]
-                    suffix_tokens_2d = candidate_tokens_3d[
-                        :, :, shared_prefix_len:
-                    ].reshape(bs, num_candidates * suffix_len)
-                    verify_tokens_2d = torch.cat(
-                        [shared_tokens_2d, suffix_tokens_2d], dim=1
+            if num_candidates > 1:
+                verify_mode = str(self._multi_candidate_verify_mode).lower().strip()
+                if verify_mode not in {"packed_tree", "batched"}:
+                    raise RuntimeError(
+                        "Unsupported DFLASH multi-candidate verify mode "
+                        f"{self._multi_candidate_verify_mode!r}."
                     )
+                shared_prefix_len = int(
+                    max(
+                        0,
+                        min(
+                            int(runtime_block_size),
+                            int(
+                                candidate_info.get(
+                                    "shared_prefix_len", sampled_suffix_start
+                                )
+                            ),
+                        ),
+                    )
+                )
+                compact_tree = bool(
+                    verify_mode == "packed_tree"
+                    and 0 < shared_prefix_len < int(runtime_block_size)
+                )
+                verify_input = None
+                if verify_mode == "packed_tree":
+                    if compact_tree:
+                        suffix_len = int(runtime_block_size - shared_prefix_len)
+                        shared_tokens_2d = candidate_tokens_3d[:, 0, :shared_prefix_len]
+                        suffix_tokens_2d = candidate_tokens_3d[
+                            :, :, shared_prefix_len:
+                        ].reshape(bs, num_candidates * suffix_len)
+                        verify_tokens_2d = torch.cat(
+                            [shared_tokens_2d, suffix_tokens_2d], dim=1
+                        )
 
-                    shared_positions_2d = positions_2d[:, :shared_prefix_len]
-                    suffix_positions_2d = (
-                        positions_2d[:, shared_prefix_len:]
-                        .unsqueeze(1)
-                        .expand(bs, num_candidates, suffix_len)
-                        .reshape(bs, num_candidates * suffix_len)
+                        shared_positions_2d = positions_2d[:, :shared_prefix_len]
+                        suffix_positions_2d = (
+                            positions_2d[:, shared_prefix_len:]
+                            .unsqueeze(1)
+                            .expand(bs, num_candidates, suffix_len)
+                            .reshape(bs, num_candidates * suffix_len)
+                        )
+                        verify_positions_2d = torch.cat(
+                            [shared_positions_2d, suffix_positions_2d], dim=1
+                        )
+                    else:
+                        verify_tokens_2d = candidate_tokens_3d.reshape(
+                            bs, num_candidates * int(runtime_block_size)
+                        )
+                        verify_positions_2d = (
+                            positions_2d[:, :runtime_block_size]
+                            .unsqueeze(1)
+                            .expand(bs, num_candidates, runtime_block_size)
+                            .reshape(bs, num_candidates * int(runtime_block_size))
+                        )
+                    verify_input = DFlashVerifyInput(
+                        draft_token=verify_tokens_2d.reshape(-1).contiguous(),
+                        positions=verify_positions_2d.reshape(-1).contiguous(),
+                        draft_token_num=int(runtime_block_size),
+                        topk=int(num_candidates),
+                        num_candidates=int(num_candidates),
+                        candidate_block_size=int(runtime_block_size),
+                        shared_prefix_len=int(shared_prefix_len if compact_tree else 0),
                     )
-                    verify_positions_2d = torch.cat(
-                        [shared_positions_2d, suffix_positions_2d], dim=1
+                    (
+                        verify_mask_backend,
+                        build_custom_mask,
+                    ) = resolve_dflash_verify_mask_policy(
+                        self.model_runner.attn_backend,
+                        num_candidates=num_candidates,
                     )
+                    verify_input.prepare_for_verify(
+                        batch,
+                        self.page_size,
+                        build_custom_mask=build_custom_mask,
+                    )
+                    effective_verify_tokens_per_req = int(verify_tokens_2d.shape[1])
                 else:
-                    verify_tokens_2d = candidate_tokens_3d.reshape(
-                        bs, num_candidates * int(runtime_block_size)
+                    verify_mask_backend, build_custom_mask = (
+                        resolve_dflash_verify_mask_policy(
+                            self.model_runner.attn_backend,
+                            num_candidates=1,
+                        )
                     )
-                    verify_positions_2d = (
-                        positions_2d[:, :runtime_block_size]
-                        .unsqueeze(1)
-                        .expand(bs, num_candidates, runtime_block_size)
-                        .reshape(bs, num_candidates * int(runtime_block_size))
+                    effective_verify_tokens_per_req = int(runtime_block_size) * int(
+                        num_candidates
                     )
-                verify_input = DFlashVerifyInput(
-                    draft_token=verify_tokens_2d.reshape(-1).contiguous(),
-                    positions=verify_positions_2d.reshape(-1).contiguous(),
-                    draft_token_num=int(runtime_block_size),
-                    topk=int(num_candidates),
-                    num_candidates=int(num_candidates),
-                    candidate_block_size=int(runtime_block_size),
-                    shared_prefix_len=int(shared_prefix_len if compact_tree else 0),
-                )
-                (
-                    verify_mask_backend,
-                    build_custom_mask,
-                ) = resolve_dflash_verify_mask_policy(
-                    self.model_runner.attn_backend,
-                    num_candidates=num_candidates,
-                )
-                verify_input.prepare_for_verify(
-                    batch,
-                    self.page_size,
-                    build_custom_mask=build_custom_mask,
-                )
-                effective_verify_tokens_per_req = int(verify_tokens_2d.shape[1])
-            else:
-                verify_mask_backend, build_custom_mask = resolve_dflash_verify_mask_policy(
-                    self.model_runner.attn_backend,
-                    num_candidates=1,
-                )
-                effective_verify_tokens_per_req = int(runtime_block_size) * int(
-                    num_candidates
-                )
 
-            self._record_runtime_verify_token_usage(batch, int(runtime_block_size))
-            self._last_verify_token_num = int(runtime_block_size)
-            self._last_confidence_gate_decision = {
-                "enabled": False,
-                "selection_reason": f"multi_candidate_full_verify_{verify_mode}",
-                "verify_token_num": int(runtime_block_size),
-            }
-            self._last_per_req_verify_tokens = torch.full(
-                (bs,),
-                int(runtime_block_size),
-                dtype=torch.int32,
-                device=device,
-            )
-            self._last_draft_tokens_2d = draft_tokens[:, :runtime_block_size]
-            self._last_verify_positions_2d = positions_2d[:, :runtime_block_size]
-            self._last_grouped_verify_active = False
-            self._last_grouped_verify_plan = []
-            self._cache_predictor_cycle_features(
-                draft_hidden=draft_hidden,
-                runtime_block_size=int(runtime_block_size),
-                per_req_verify_tokens=self._last_per_req_verify_tokens,
-            )
-            self._last_multi_candidate_info = {
-                **candidate_info,
-                "candidate_tokens_3d": candidate_tokens_3d,
-                "runtime_block_size": int(runtime_block_size),
-                "candidate_block_size": int(runtime_block_size),
-                "compact_tree": bool(compact_tree),
-                "shared_prefix_len": int(shared_prefix_len if compact_tree else 0),
-                "effective_verify_tokens_per_req": int(effective_verify_tokens_per_req),
-                "verify_mask_backend": str(verify_mask_backend),
-                "build_custom_mask": bool(build_custom_mask),
-                "verify_mode": verify_mode,
-            }
-            batch.forward_mode = (
-                ForwardMode.TARGET_VERIFY
-                if not batch.forward_mode.is_idle()
-                else ForwardMode.IDLE
-            )
-            batch.spec_info = verify_input
-            batch.return_hidden_states = False
-            return
+                self._record_runtime_verify_token_usage(batch, int(runtime_block_size))
+                self._last_verify_token_num = int(runtime_block_size)
+                self._last_confidence_gate_decision = {
+                    "enabled": False,
+                    "selection_reason": f"multi_candidate_full_verify_{verify_mode}",
+                    "verify_token_num": int(runtime_block_size),
+                }
+                self._last_per_req_verify_tokens = torch.full(
+                    (bs,),
+                    int(runtime_block_size),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self._last_draft_tokens_2d = draft_tokens[:, :runtime_block_size]
+                self._last_verify_positions_2d = positions_2d[:, :runtime_block_size]
+                self._last_grouped_verify_active = False
+                self._last_grouped_verify_plan = []
+                self._cache_predictor_cycle_features(
+                    draft_hidden=draft_hidden,
+                    runtime_block_size=int(runtime_block_size),
+                    per_req_verify_tokens=self._last_per_req_verify_tokens,
+                )
+                self._last_multi_candidate_info = {
+                    **candidate_info,
+                    "candidate_tokens_3d": candidate_tokens_3d,
+                    "runtime_block_size": int(runtime_block_size),
+                    "candidate_block_size": int(runtime_block_size),
+                    "compact_tree": bool(compact_tree),
+                    "shared_prefix_len": int(shared_prefix_len if compact_tree else 0),
+                    "effective_verify_tokens_per_req": int(
+                        effective_verify_tokens_per_req
+                    ),
+                    "verify_mask_backend": str(verify_mask_backend),
+                    "build_custom_mask": bool(build_custom_mask),
+                    "verify_mode": verify_mode,
+                }
+                batch.forward_mode = (
+                    ForwardMode.TARGET_VERIFY
+                    if not batch.forward_mode.is_idle()
+                    else ForwardMode.IDLE
+                )
+                batch.spec_info = verify_input
+                batch.return_hidden_states = False
+                return
 
         verify_token_num = int(runtime_block_size)
         confidence_gate_decision = None
