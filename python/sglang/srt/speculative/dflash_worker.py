@@ -2825,6 +2825,12 @@ class DFlashWorker:
             sampled_suffix_start = int(
                 candidate_info.get("sampled_suffix_start", runtime_block_size)
             )
+            verify_mode = str(self._multi_candidate_verify_mode).lower().strip()
+            if verify_mode not in {"packed_tree", "batched"}:
+                raise RuntimeError(
+                    "Unsupported DFLASH multi-candidate verify mode "
+                    f"{self._multi_candidate_verify_mode!r}."
+                )
             shared_prefix_len = int(
                 max(
                     0,
@@ -2835,7 +2841,8 @@ class DFlashWorker:
                 )
             )
             compact_tree = bool(
-                num_candidates > 1
+                verify_mode == "packed_tree"
+                and num_candidates > 1
                 and 0 < shared_prefix_len < int(runtime_block_size)
             )
             if compact_tree:
@@ -2889,7 +2896,7 @@ class DFlashWorker:
             self._last_verify_token_num = int(runtime_block_size)
             self._last_confidence_gate_decision = {
                 "enabled": False,
-                "selection_reason": "multi_candidate_full_verify",
+                "selection_reason": f"multi_candidate_full_verify_{verify_mode}",
                 "verify_token_num": int(runtime_block_size),
             }
             self._last_per_req_verify_tokens = torch.full(

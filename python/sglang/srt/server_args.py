@@ -527,7 +527,9 @@ class ServerArgs:
     speculative_dflash_multi_candidate_max_candidates: int = 4
     speculative_dflash_multi_candidate_sample_temperature: float = 1.0
     speculative_dflash_multi_candidate_deterministic_prefix_len: int = 0
-    speculative_dflash_multi_candidate_verify_mode: Literal["packed_tree"] = "packed_tree"
+    speculative_dflash_multi_candidate_verify_mode: Literal[
+        "packed_tree", "batched"
+    ] = "packed_tree"
     speculative_dflash_multi_candidate_verify_attention_backend: Optional[
         Literal["triton"]
     ] = None
@@ -3026,10 +3028,27 @@ class ServerArgs:
                     deterministic_prefix_len
                 )
 
+                verify_mode = str(
+                    self.speculative_dflash_multi_candidate_verify_mode
+                ).lower().strip()
+                if verify_mode not in {"packed_tree", "batched"}:
+                    raise ValueError(
+                        "DFLASH multi-candidate verify mode must be one of "
+                        "{'packed_tree', 'batched'}. "
+                        f"Got {self.speculative_dflash_multi_candidate_verify_mode!r}."
+                    )
+                self.speculative_dflash_multi_candidate_verify_mode = verify_mode
+
                 verify_backend = (
                     self.speculative_dflash_multi_candidate_verify_attention_backend
                 )
                 if verify_backend is not None:
+                    if verify_mode != "packed_tree":
+                        raise ValueError(
+                            "--speculative-dflash-multi-candidate-verify-attention-backend "
+                            "is only valid with --speculative-dflash-multi-candidate-verify-mode "
+                            "'packed_tree'."
+                        )
                     verify_backend = str(verify_backend).strip()
                     if verify_backend != "triton":
                         raise ValueError(
@@ -3048,16 +3067,6 @@ class ServerArgs:
                     "--speculative-dflash-multi-candidate-verify-attention-backend "
                     "requires --speculative-dflash-multi-candidate."
                 )
-
-                verify_mode = str(
-                    self.speculative_dflash_multi_candidate_verify_mode
-                ).lower().strip()
-                if verify_mode != "packed_tree":
-                    raise ValueError(
-                        "DFLASH multi-candidate verify mode must be 'packed_tree'. "
-                        f"Got {self.speculative_dflash_multi_candidate_verify_mode!r}."
-                    )
-                self.speculative_dflash_multi_candidate_verify_mode = verify_mode
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -5056,8 +5065,13 @@ class ServerArgs:
             "--speculative-dflash-multi-candidate-verify-mode",
             type=str,
             default=ServerArgs.speculative_dflash_multi_candidate_verify_mode,
-            choices=["packed_tree"],
-            help="DFLASH multi-candidate verify mode.",
+            choices=["packed_tree", "batched"],
+            help=(
+                "DFLASH multi-candidate verify mode. "
+                "'packed_tree' packs a shared prefix plus candidate suffixes; "
+                "'batched' verifies each candidate block independently without "
+                "shared-prefix tree compaction."
+            ),
         )
         parser.add_argument(
             "--speculative-dflash-multi-candidate-verify-attention-backend",

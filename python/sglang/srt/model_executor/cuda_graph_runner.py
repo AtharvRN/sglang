@@ -527,11 +527,20 @@ class CudaGraphRunner:
                             0,
                         )
                     )
+                    verify_mode = str(
+                        getattr(
+                            self.model_runner.server_args,
+                            "speculative_dflash_multi_candidate_verify_mode",
+                            "packed_tree",
+                        )
+                    ).lower().strip()
                     sample_start_pos = max(
                         1,
                         min(candidate_block_size, 1 + det_prefix_len),
                     )
-                    compact_shared_prefix = int(sample_start_pos)
+                    compact_shared_prefix = (
+                        int(sample_start_pos) if verify_mode == "packed_tree" else 0
+                    )
                     multi_candidate_buckets = []
                     for cand in range(1, max_candidates + 1):
                         if (
@@ -1466,11 +1475,20 @@ class CudaGraphRunner:
                         0,
                     )
                 )
+                verify_mode = str(
+                    getattr(
+                        self.model_runner.server_args,
+                        "speculative_dflash_multi_candidate_verify_mode",
+                        "packed_tree",
+                    )
+                ).lower().strip()
                 sample_start_pos = max(
                     1,
                     min(candidate_block_size, 1 + det_prefix_len),
                 )
-                compact_shared_prefix = int(sample_start_pos)
+                compact_shared_prefix = (
+                    int(sample_start_pos) if verify_mode == "packed_tree" else 0
+                )
                 layout_by_tokens: Dict[int, tuple[int, int]] = {}
                 for cand in range(1, max_candidates + 1):
                     if (
