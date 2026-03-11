@@ -1153,7 +1153,7 @@ class DFlashWorker:
         batch: ScheduleBatch,
         num_candidates: int,
         temp_req_pool_indices: torch.Tensor,
-        ) -> ScheduleBatch:
+    ) -> ScheduleBatch:
         """Build a temporary batch with one independent verify row per candidate."""
 
         bs = batch.batch_size()
@@ -1223,8 +1223,10 @@ class DFlashWorker:
             ),
             output_ids=None,
             multimodal_inputs=None,
-            global_num_tokens=batch.global_num_tokens,
-            global_num_tokens_for_logprob=batch.global_num_tokens_for_logprob,
+            global_num_tokens=_scale_global_token_counts(batch.global_num_tokens),
+            global_num_tokens_for_logprob=_scale_global_token_counts(
+                batch.global_num_tokens_for_logprob
+            ),
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
@@ -1233,7 +1235,7 @@ class DFlashWorker:
             return_logprob=any(req.return_logprob for req in sub_reqs),
             temp_scaled_logprobs=batch.temp_scaled_logprobs,
             top_p_normalized_logprobs=batch.top_p_normalized_logprobs,
-            decoding_reqs=batch.decoding_reqs,
+            decoding_reqs=sub_reqs,
             has_stream=any(req.stream for req in sub_reqs),
             has_grammar=any(req.grammar for req in sub_reqs),
             device=batch.device,
@@ -1285,13 +1287,6 @@ class DFlashWorker:
 
         sub_batch.has_stream = any(req.stream for req in sub_batch.reqs)
         sub_batch.has_grammar = any(req.grammar for req in sub_batch.reqs)
-        sub_batch.decoding_reqs = sub_reqs
-        sub_batch.global_num_tokens = _scale_global_token_counts(
-            batch.global_num_tokens
-        )
-        sub_batch.global_num_tokens_for_logprob = _scale_global_token_counts(
-            batch.global_num_tokens_for_logprob
-        )
 
         if batch.sampling_info is not None:
             sub_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
