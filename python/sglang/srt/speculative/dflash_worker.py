@@ -1161,23 +1161,84 @@ class DFlashWorker:
             bs, device=self.device, dtype=torch.int64
         ).repeat_interleave(int(num_candidates))
         parent_rows_cpu = parent_rows_device.tolist()
+        candidate_rows_cpu = (
+            torch.arange(int(num_candidates), device=self.device, dtype=torch.int64)
+            .repeat(bs)
+            .tolist()
+        )
 
-        sub_batch = copy.copy(batch)
-        sub_batch.reqs = [batch.reqs[i] for i in parent_rows_cpu]
-        sub_batch.req_pool_indices = temp_req_pool_indices
-        sub_batch.seq_lens = batch.seq_lens[parent_rows_device]
+        sub_reqs = []
+        for row_idx, (parent_idx, candidate_idx) in enumerate(
+            zip(parent_rows_cpu, candidate_rows_cpu, strict=True)
+        ):
+            parent_req = batch.reqs[parent_idx]
+            req_clone = copy.copy(parent_req)
+            req_clone.rid = (
+                f"{getattr(parent_req, 'rid', parent_idx)}"
+                f"__dense_verify_c{int(candidate_idx)}"
+            )
+            req_clone.req_pool_idx = int(temp_req_pool_indices[row_idx].item())
+            req_clone.output_ids = list(parent_req.output_ids)
+            req_clone.fill_ids = list(parent_req.fill_ids)
+
+            sampling_params = getattr(parent_req, "sampling_params", None)
+            custom_params = getattr(sampling_params, "custom_params", None)
+            if isinstance(custom_params, dict):
+                sampling_params = copy.copy(sampling_params)
+                sampling_params.custom_params = dict(custom_params)
+                sampling_params.custom_params["__req__"] = req_clone
+                req_clone.sampling_params = sampling_params
+
+            sub_reqs.append(req_clone)
+
+        sub_batch = ScheduleBatch(
+            reqs=sub_reqs,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+            tree_cache=batch.tree_cache,
+            is_hybrid_swa=batch.is_hybrid_swa,
+            model_config=batch.model_config,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            enable_overlap=batch.enable_overlap,
+            chunked_req=batch.chunked_req,
+            req_pool_indices=temp_req_pool_indices,
+            seq_lens=batch.seq_lens[parent_rows_device],
+            seq_lens_sum=0,
+            orig_seq_lens=(
+                batch.orig_seq_lens[parent_rows_device]
+                if batch.orig_seq_lens is not None
+                else None
+            ),
+            output_ids=None,
+            multimodal_inputs=None,
+            global_num_tokens=batch.global_num_tokens,
+            global_num_tokens_for_logprob=batch.global_num_tokens_for_logprob,
+            is_extend_in_batch=batch.is_extend_in_batch,
+            all_extend_in_batch=batch.all_extend_in_batch,
+            can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            tbo_split_seq_index=batch.tbo_split_seq_index,
+            global_forward_mode=batch.global_forward_mode,
+            return_logprob=any(req.return_logprob for req in sub_reqs),
+            temp_scaled_logprobs=batch.temp_scaled_logprobs,
+            top_p_normalized_logprobs=batch.top_p_normalized_logprobs,
+            decoding_reqs=batch.decoding_reqs,
+            has_stream=any(req.stream for req in sub_reqs),
+            has_grammar=any(req.grammar for req in sub_reqs),
+            device=batch.device,
+            spec_algorithm=batch.spec_algorithm,
+            return_hidden_states=False,
+            return_routed_experts=batch.return_routed_experts,
+            is_prefill_only=batch.is_prefill_only,
+            dllm_config=batch.dllm_config,
+            dp_cooperation_info=batch.dp_cooperation_info,
+            prefill_stats=batch.prefill_stats,
+        )
         if isinstance(batch.seq_lens_cpu, torch.Tensor):
             sub_batch.seq_lens_cpu = batch.seq_lens_cpu[parent_rows_cpu]
         else:
             sub_batch.seq_lens_cpu = [batch.seq_lens_cpu[i] for i in parent_rows_cpu]
-        sub_batch.orig_seq_lens = (
-            batch.orig_seq_lens[parent_rows_device]
-            if batch.orig_seq_lens is not None
-            else None
-        )
         sub_batch.seq_lens_sum = int(sub_batch.seq_lens.sum().item())
         sub_batch.out_cache_loc = None
-        sub_batch.forward_mode = ForwardMode.TARGET_VERIFY
         sub_batch.spec_info = None
 
         if batch.output_ids is not None:
@@ -1195,7 +1256,6 @@ class DFlashWorker:
         else:
             sub_batch.multimodal_inputs = None
 
-        sub_batch.return_logprob = any(req.return_logprob for req in sub_batch.reqs)
         if sub_batch.return_logprob:
             sub_batch.top_logprobs_nums = (
                 [batch.top_logprobs_nums[i] for i in parent_rows_cpu]
