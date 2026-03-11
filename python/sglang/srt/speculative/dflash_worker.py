@@ -756,30 +756,7 @@ class DFlashWorker:
 
         bs = int(token_hidden.shape[0])
         proposed = int(token_hidden.shape[1])
-        token_hidden = token_hidden.to(dtype=torch.float32)
-        draft_pos = torch.arange(
-            1,
-            proposed + 1,
-            device=token_hidden.device,
-            dtype=torch.float32,
-        ).view(1, proposed, 1)
-        draft_pos = draft_pos.expand(bs, proposed, 1)
-        pos_norm = draft_pos / float(max(int(runtime_block_size), 1))
-        bs_norm = torch.full(
-            (bs, proposed, 1),
-            float(runtime_block_size) / float(max(int(self.block_size), 1)),
-            device=token_hidden.device,
-            dtype=torch.float32,
-        )
-        features = torch.cat(
-            [
-                token_hidden,
-                draft_pos / 16.0,
-                pos_norm,
-                bs_norm,
-            ],
-            dim=2,
-        )
+        features = token_hidden.to(dtype=torch.float32)
         if int(features.shape[2]) != int(self._accept_predictor.input_dim):
             raise RuntimeError(
                 "DFLASH predictor feature dimension mismatch. "
@@ -820,7 +797,12 @@ class DFlashWorker:
         )
         threshold = float(self._confidence_gate_threshold)
         if accept_probs is not None and accept_probs.numel() > 0:
-            below = accept_probs < float(threshold)
+            prefix_accept_probs = torch.cumprod(
+                torch.clamp(accept_probs.to(dtype=torch.float32), min=1e-6, max=1.0),
+                dim=1,
+            )
+            prefix_reject_probs = 1.0 - prefix_accept_probs
+            below = prefix_reject_probs > float(threshold)
             has_below = torch.any(below, dim=1)
             first_idx = torch.argmax(below.to(torch.int32), dim=1) + 1
             per_req_verify_tokens = torch.where(
@@ -843,12 +825,23 @@ class DFlashWorker:
             "enabled": True,
             "mode": "predictor",
             "threshold": float(threshold),
-            "selection_reason": "predictor_threshold",
+            "selection_reason": "predictor_cumulative_reject_threshold",
             "aggregate": str(self._confidence_gate_aggregate),
             "min_verify_tokens": int(self._confidence_gate_min_verify_tokens),
             "runtime_block_size": int(runtime_block_size),
             "verify_token_num": int(verify_token_num),
             "per_req_verify_tokens": [int(v) for v in per_req_verify_tokens.tolist()],
+            "per_req_stop_prob": (
+                [
+                    float(v)
+                    for v in (1.0 - torch.cumprod(
+                        torch.clamp(accept_probs.to(dtype=torch.float32), min=1e-6, max=1.0),
+                        dim=1,
+                    )).amax(dim=1).values.tolist()
+                ]
+                if accept_probs is not None and accept_probs.numel() > 0
+                else []
+            ),
             "per_req_mean_accept_prob": (
                 [float(v) for v in accept_probs.mean(dim=1).tolist()]
                 if accept_probs is not None and accept_probs.numel() > 0
