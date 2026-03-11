@@ -132,6 +132,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         seq_len_fill_value: int,
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
+        custom_mask_max_prefix_tokens: int | None,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
     ) -> "DecodeInputBuffers":
@@ -144,8 +145,21 @@ class DecodeInputBuffers(ForwardInputBuffers):
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            custom_mask_numel = int(
+                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs
+            )
+            # TARGET_VERIFY custom masks scale with the true cached-prefix length, not
+            # the padded seq-len fill value (often 0/1 for FlashInfer). Size the replay
+            # buffer against the KV-token capacity to avoid graph replay overflows on
+            # longer requests in speculative verify modes.
+            if custom_mask_max_prefix_tokens is not None:
+                custom_mask_numel = max(
+                    custom_mask_numel,
+                    int(custom_mask_max_prefix_tokens + max_num_token)
+                    * int(num_tokens_per_bs),
+                )
             custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                (custom_mask_numel,),
                 dtype=torch.bool,
             )
             next_token_logits_buffer = torch.zeros(
@@ -720,6 +734,14 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+        custom_mask_max_prefix_tokens = None
+        if (
+            self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not self.model_runner.is_draft_worker
+        ):
+            custom_mask_max_prefix_tokens = int(
+                getattr(self.model_runner, "max_total_num_tokens", 0)
+            )
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -734,6 +756,7 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self._buffer_num_tokens_per_bs,
+            custom_mask_max_prefix_tokens=custom_mask_max_prefix_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
         )
