@@ -1912,6 +1912,7 @@ class Scheduler(
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        scheduler_select_start_t = time.perf_counter()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -1986,6 +1987,15 @@ class Scheduler(
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
 
         if ret:
+            schedule_ts = time.perf_counter()
+            batch_select_time_s = max(
+                float(schedule_ts) - float(scheduler_select_start_t), 0.0
+            )
+            for req in ret.reqs:
+                req.time_stats.mark_decode_cycle_rescheduled(
+                    ts=schedule_ts,
+                    batch_select_time_s=batch_select_time_s,
+                )
             set_schedule_time_batch(ret)
 
         return ret

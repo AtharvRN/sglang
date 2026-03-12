@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -525,6 +526,14 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats_every_iteration(
                 batch, num_accepted_tokens=result.num_accepted_tokens
             )
+
+        cycle_done_ts = None
+        for req in batch.reqs:
+            if req.finished() or req.is_retracted:
+                continue
+            if cycle_done_ts is None:
+                cycle_done_ts = time.perf_counter()
+            req.time_stats.mark_decode_cycle_postprocess_done(cycle_done_ts)
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int

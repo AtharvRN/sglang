@@ -555,6 +555,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_decode_scheduled_time: float = 0.0
     decode_waiting_time_s: float = 0.0
     decode_waiting_ct: int = 0
+    last_decode_cycle_postprocess_done_time: float = 0.0
+    scheduler_decode_cycle_gap_time_s: float = 0.0
+    scheduler_decode_cycle_gap_ct: int = 0
+    scheduler_batch_select_time_s: float = 0.0
+    scheduler_batch_select_ct: int = 0
     last_forward_entry_time: float = 0.0
     last_prefill_finished_time: float = 0.0
 
@@ -577,6 +582,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_finished_time": self.prefill_finished_time,
             "decode_waiting_time_s": self.decode_waiting_time_s,
             "decode_waiting_ct": self.decode_waiting_ct,
+            "scheduler_decode_cycle_gap_time_s": self.scheduler_decode_cycle_gap_time_s,
+            "scheduler_decode_cycle_gap_ct": self.scheduler_decode_cycle_gap_ct,
+            "scheduler_batch_select_time_s": self.scheduler_batch_select_time_s,
+            "scheduler_batch_select_ct": self.scheduler_batch_select_ct,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -596,6 +605,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_chunked_prefill_finish_time = 0.0
         self.last_decode_finish_time = 0.0
         self.last_decode_scheduled_time = 0.0
+        self.last_decode_cycle_postprocess_done_time = 0.0
 
         self.trace_ctx.trace_event("retract", 1, convert_time_to_realtime_ns(ts))
 
@@ -787,6 +797,26 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if forward_mode.is_decode():
             self.last_decode_scheduled_time = ts
 
+    def mark_decode_cycle_postprocess_done(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.last_decode_cycle_postprocess_done_time = float(ts)
+
+    def mark_decode_cycle_rescheduled(
+        self, *, ts=None, batch_select_time_s: float = 0.0
+    ):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.last_decode_cycle_postprocess_done_time > 0.0:
+            self.scheduler_decode_cycle_gap_time_s += max(
+                float(ts) - float(self.last_decode_cycle_postprocess_done_time), 0.0
+            )
+            self.scheduler_decode_cycle_gap_ct += 1
+            self.last_decode_cycle_postprocess_done_time = 0.0
+            if batch_select_time_s > 0.0:
+                self.scheduler_batch_select_time_s += float(batch_select_time_s)
+                self.scheduler_batch_select_ct += 1
+
     def set_completion_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
@@ -955,6 +985,28 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 "decode_waiting_time_per_step_s": (
                     float(self.decode_waiting_time_s) / float(self.decode_waiting_ct)
                     if self.decode_waiting_ct > 0
+                    else None
+                ),
+                "scheduler_decode_cycle_gap_time_s": float(
+                    self.scheduler_decode_cycle_gap_time_s
+                ),
+                "scheduler_decode_cycle_gap_ct": int(
+                    self.scheduler_decode_cycle_gap_ct
+                ),
+                "scheduler_decode_cycle_gap_time_per_step_s": (
+                    float(self.scheduler_decode_cycle_gap_time_s)
+                    / float(self.scheduler_decode_cycle_gap_ct)
+                    if self.scheduler_decode_cycle_gap_ct > 0
+                    else None
+                ),
+                "scheduler_batch_select_time_s": float(
+                    self.scheduler_batch_select_time_s
+                ),
+                "scheduler_batch_select_ct": int(self.scheduler_batch_select_ct),
+                "scheduler_batch_select_time_per_step_s": (
+                    float(self.scheduler_batch_select_time_s)
+                    / float(self.scheduler_batch_select_ct)
+                    if self.scheduler_batch_select_ct > 0
                     else None
                 ),
             }
