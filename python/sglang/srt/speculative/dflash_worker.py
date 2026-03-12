@@ -824,11 +824,10 @@ class DFlashWorker:
                 f"expected={self._accept_predictor.input_dim} got={features.shape[2]}."
             )
         with torch.inference_mode():
-            logits, predictor_time_s = self._measure_wall_time_s(
+            logits, predictor_time_s = self._measure_forward_s(
                 lambda: self._accept_predictor.model(
                     features.reshape(bs * proposed, int(features.shape[2]))
-                ),
-                sync_cuda=self._report_timing,
+                )
             )
             self._last_predictor_time_s = float(predictor_time_s)
             probs = torch.sigmoid(logits.to(dtype=torch.float32)).reshape(bs, proposed)

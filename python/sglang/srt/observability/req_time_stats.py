@@ -553,6 +553,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_decode_finish_time: float = 0.0
     decode_ct: int = 0
     last_decode_scheduled_time: float = 0.0
+    decode_waiting_time_s: float = 0.0
+    decode_waiting_ct: int = 0
     last_forward_entry_time: float = 0.0
     last_prefill_finished_time: float = 0.0
 
@@ -573,6 +575,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_run_batch_start_time": self.prefill_run_batch_start_time,
             "prefill_run_batch_end_time": self.prefill_run_batch_end_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "decode_waiting_time_s": self.decode_waiting_time_s,
+            "decode_waiting_ct": self.decode_waiting_ct,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -746,6 +750,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_last_scheduled_time(self, forward_mode: ForwardMode, ts=None, attrs=None):
         if ts is None:
             ts = time.perf_counter()
+
+        if forward_mode.is_decode():
+            if self.last_decode_finish_time > 0.0:
+                self.decode_waiting_time_s += max(
+                    float(ts) - float(self.last_decode_finish_time), 0.0
+                )
+                self.decode_waiting_ct += 1
+            elif self.last_prefill_finished_time > 0.0:
+                self.decode_waiting_time_s += max(
+                    float(ts) - float(self.last_prefill_finished_time), 0.0
+                )
+                self.decode_waiting_ct += 1
 
         if self.trace_ctx.tracing_enable:
             if (
@@ -934,6 +950,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 "queue_time": self.get_queueing_time(),
                 "prefill_waiting_latency": self.get_prefill_waiting_latency(),
                 "prefill_launch_latency": self.get_prefill_launch_latency(),
+                "decode_waiting_time_s": float(self.decode_waiting_time_s),
+                "decode_waiting_ct": int(self.decode_waiting_ct),
+                "decode_waiting_time_per_step_s": (
+                    float(self.decode_waiting_time_s) / float(self.decode_waiting_ct)
+                    if self.decode_waiting_ct > 0
+                    else None
+                ),
             }
         )
         return meta_data
@@ -943,19 +966,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
 
 def set_schedule_time_batch(batch: ScheduleBatch):
-    # only for tracing
-    if not get_global_tracing_enabled():
-        return
-
     ts = time.perf_counter()
-    bid = uuid.uuid4().hex[:8]
-    _attrs = {"bid": bid, "batch_size": len(batch.reqs)}
-    if batch.forward_mode.is_decode():
-        _attrs["forward_mode"] = "decode"
-    elif batch.forward_mode.is_prefill():
-        _attrs["forward_mode"] = "prefill"
-    elif batch.forward_mode.is_prebuilt():
-        _attrs["forward_mode"] = "prebuilt"
+    _attrs = None
+    if get_global_tracing_enabled():
+        bid = uuid.uuid4().hex[:8]
+        _attrs = {"bid": bid, "batch_size": len(batch.reqs)}
+        if batch.forward_mode.is_decode():
+            _attrs["forward_mode"] = "decode"
+        elif batch.forward_mode.is_prefill():
+            _attrs["forward_mode"] = "prefill"
+        elif batch.forward_mode.is_prebuilt():
+            _attrs["forward_mode"] = "prebuilt"
 
     for req in batch.reqs:
         req.time_stats.set_last_scheduled_time(batch.forward_mode, ts, _attrs)
