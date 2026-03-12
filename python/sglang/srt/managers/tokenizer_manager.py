@@ -1878,6 +1878,47 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             verify_time_s / recv_obj.spec_verify_ct[i]
                         )
 
+            if (
+                hasattr(recv_obj, "spec_predictor_time_s")
+                and recv_obj.spec_predictor_time_s is not None
+                and len(recv_obj.spec_predictor_time_s) > i
+            ):
+                predictor_time_s = recv_obj.spec_predictor_time_s[i]
+                if predictor_time_s is not None:
+                    meta_info["spec_predictor_time_s"] = float(predictor_time_s)
+                    if recv_obj.spec_verify_ct[i] > 0:
+                        meta_info["spec_predictor_time_per_cycle_s"] = float(
+                            predictor_time_s / recv_obj.spec_verify_ct[i]
+                        )
+
+            if (
+                hasattr(recv_obj, "spec_confidence_gate_time_s")
+                and recv_obj.spec_confidence_gate_time_s is not None
+                and len(recv_obj.spec_confidence_gate_time_s) > i
+            ):
+                gate_time_s = recv_obj.spec_confidence_gate_time_s[i]
+                if gate_time_s is not None:
+                    meta_info["spec_confidence_gate_time_s"] = float(gate_time_s)
+                    if recv_obj.spec_verify_ct[i] > 0:
+                        meta_info["spec_confidence_gate_time_per_cycle_s"] = float(
+                            gate_time_s / recv_obj.spec_verify_ct[i]
+                        )
+
+            if (
+                hasattr(recv_obj, "spec_confidence_gate_state_time_s")
+                and recv_obj.spec_confidence_gate_state_time_s is not None
+                and len(recv_obj.spec_confidence_gate_state_time_s) > i
+            ):
+                gate_state_time_s = recv_obj.spec_confidence_gate_state_time_s[i]
+                if gate_state_time_s is not None:
+                    meta_info["spec_confidence_gate_state_time_s"] = float(
+                        gate_state_time_s
+                    )
+                    if recv_obj.spec_verify_ct[i] > 0:
+                        meta_info["spec_confidence_gate_state_time_per_cycle_s"] = (
+                            float(gate_state_time_s / recv_obj.spec_verify_ct[i])
+                        )
+
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
                 recv_obj.spec_acceptance_histogram

@@ -384,6 +384,9 @@ class DFlashWorker:
         self._last_confidence_gate_decision = None
         self._last_verify_token_num = int(self.block_size)
         self._last_per_req_verify_tokens: Optional[torch.Tensor] = None
+        self._last_predictor_time_s = 0.0
+        self._last_confidence_gate_time_s = 0.0
+        self._last_confidence_gate_state_time_s = 0.0
         self._last_draft_tokens_2d: Optional[torch.Tensor] = None
         self._last_verify_positions_2d: Optional[torch.Tensor] = None
         self._last_grouped_verify_active = False
@@ -715,6 +718,9 @@ class DFlashWorker:
         out_i = int(min(out_i, int(runtime_block_size)))
         return out_i
 
+    def _should_materialize_confidence_gate_trace(self) -> bool:
+        return bool(self._report_cycle_trace)
+
     def _compute_confidence_gated_verify_tokens(
         self,
         *,
@@ -723,21 +729,64 @@ class DFlashWorker:
         draft_hidden: Optional[torch.Tensor],
         runtime_block_size: int,
     ) -> tuple[int, dict, torch.Tensor]:
-        if self._confidence_gate_mode == "predictor":
-            return self._compute_predictor_gated_verify_tokens(
-                draft_hidden=draft_hidden,
-                runtime_block_size=runtime_block_size,
-            )
-        if self._confidence_gate_mode == "score":
-            return self._compute_score_gated_verify_tokens(
+        self._last_confidence_gate_time_s = 0.0
+        self._last_predictor_time_s = 0.0
+        if not self._report_timing:
+            if self._confidence_gate_mode == "predictor":
+                return self._compute_predictor_gated_verify_tokens(
+                    draft_hidden=draft_hidden,
+                    runtime_block_size=runtime_block_size,
+                )
+            if self._confidence_gate_mode == "score":
+                return self._compute_score_gated_verify_tokens(
+                    draft_max_probs=draft_max_probs,
+                    draft_entropies=draft_entropies,
+                    runtime_block_size=runtime_block_size,
+                )
+            return self._compute_threshold_gated_verify_tokens(
                 draft_max_probs=draft_max_probs,
-                draft_entropies=draft_entropies,
                 runtime_block_size=runtime_block_size,
             )
-        return self._compute_threshold_gated_verify_tokens(
-            draft_max_probs=draft_max_probs,
-            runtime_block_size=runtime_block_size,
-        )
+
+        if self._confidence_gate_mode == "predictor":
+            out, gate_time_s = self._measure_wall_time_s(
+                lambda: self._compute_predictor_gated_verify_tokens(
+                    draft_hidden=draft_hidden,
+                    runtime_block_size=runtime_block_size,
+                ),
+                sync_cuda=True,
+            )
+        elif self._confidence_gate_mode == "score":
+            out, gate_time_s = self._measure_wall_time_s(
+                lambda: self._compute_score_gated_verify_tokens(
+                    draft_max_probs=draft_max_probs,
+                    draft_entropies=draft_entropies,
+                    runtime_block_size=runtime_block_size,
+                ),
+                sync_cuda=True,
+            )
+        else:
+            out, gate_time_s = self._measure_wall_time_s(
+                lambda: self._compute_threshold_gated_verify_tokens(
+                    draft_max_probs=draft_max_probs,
+                    runtime_block_size=runtime_block_size,
+                ),
+                sync_cuda=True,
+            )
+        self._last_confidence_gate_time_s = float(gate_time_s)
+        return out
+
+    def _measure_wall_time_s(
+        self,
+        fn,
+        *,
+        sync_cuda: bool = False,
+    ):
+        start_t = time.perf_counter()
+        out = fn()
+        if sync_cuda and torch.cuda.is_available() and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return out, max(time.perf_counter() - start_t, 0.0)
 
     def _predictor_accept_probs(
         self,
@@ -756,17 +805,29 @@ class DFlashWorker:
 
         bs = int(token_hidden.shape[0])
         proposed = int(token_hidden.shape[1])
-        features = token_hidden.to(dtype=torch.float32)
+        model_dtype = getattr(self._accept_predictor, "model_dtype", token_hidden.dtype)
+        features = (
+            token_hidden
+            if token_hidden.dtype == model_dtype
+            else token_hidden.to(dtype=model_dtype)
+        )
         if int(features.shape[2]) != int(self._accept_predictor.input_dim):
             raise RuntimeError(
                 "DFLASH predictor feature dimension mismatch. "
                 f"expected={self._accept_predictor.input_dim} got={features.shape[2]}."
             )
         with torch.inference_mode():
-            logits = self._accept_predictor.model(
-                features.reshape(bs * proposed, int(features.shape[2]))
+            logits, predictor_time_s = self._measure_wall_time_s(
+                lambda: self._accept_predictor.model(
+                    features.reshape(bs * proposed, int(features.shape[2]))
+                ),
+                sync_cuda=self._report_timing,
             )
-            probs = torch.sigmoid(logits).reshape(bs, proposed)
+            self._last_predictor_time_s = float(predictor_time_s)
+            probs = torch.sigmoid(logits.to(dtype=torch.float32)).reshape(bs, proposed)
+            if str(self._accept_predictor.output_mode) == "hazard":
+                probs = torch.clamp(probs, min=1e-6, max=1.0 - 1e-6)
+                probs = torch.cumprod(1.0 - probs, dim=1)
         return probs
 
     def _compute_predictor_gated_verify_tokens(
@@ -830,8 +891,16 @@ class DFlashWorker:
             "min_verify_tokens": int(self._confidence_gate_min_verify_tokens),
             "runtime_block_size": int(runtime_block_size),
             "verify_token_num": int(verify_token_num),
-            "per_req_verify_tokens": [int(v) for v in per_req_verify_tokens.tolist()],
-            "per_req_min_prefix_survival_prob": (
+            "predictor_model_path": str(self._accept_predictor.checkpoint_path),
+            "predictor_input_dim": int(self._accept_predictor.input_dim),
+            "predictor_hidden_dim": int(self._accept_predictor.hidden_dim),
+            "predictor_output_mode": str(self._accept_predictor.output_mode),
+        }
+        if self._should_materialize_confidence_gate_trace():
+            decision["per_req_verify_tokens"] = [
+                int(v) for v in per_req_verify_tokens.tolist()
+            ]
+            decision["per_req_min_prefix_survival_prob"] = (
                 [
                     float(v)
                     for v in torch.clamp(
@@ -842,16 +911,12 @@ class DFlashWorker:
                 ]
                 if accept_probs is not None and accept_probs.numel() > 0
                 else []
-            ),
-            "per_req_mean_accept_prob": (
+            )
+            decision["per_req_mean_accept_prob"] = (
                 [float(v) for v in accept_probs.mean(dim=1).tolist()]
                 if accept_probs is not None and accept_probs.numel() > 0
                 else []
-            ),
-            "predictor_model_path": str(self._accept_predictor.checkpoint_path),
-            "predictor_input_dim": int(self._accept_predictor.input_dim),
-            "predictor_hidden_dim": int(self._accept_predictor.hidden_dim),
-        }
+            )
         return int(verify_token_num), decision, per_req_verify_tokens
 
     def _compute_threshold_gated_verify_tokens(
@@ -903,7 +968,6 @@ class DFlashWorker:
             "min_verify_tokens": int(self._confidence_gate_min_verify_tokens),
             "runtime_block_size": int(runtime_block_size),
             "verify_token_num": int(verify_token_num),
-            "per_req_verify_tokens": [int(v) for v in per_req_verify_tokens.tolist()],
             "mab_enabled": bool(self._confidence_gate_mab_enabled),
             "mab_algo": str(self._confidence_gate_mab_algo),
             "mab_round": int(self._confidence_gate_mab_rounds),
@@ -913,6 +977,10 @@ class DFlashWorker:
                 else None
             ),
         }
+        if self._should_materialize_confidence_gate_trace():
+            decision["per_req_verify_tokens"] = [
+                int(v) for v in per_req_verify_tokens.tolist()
+            ]
         return int(verify_token_num), decision, per_req_verify_tokens
 
     def _compute_score_gated_verify_tokens(
@@ -1004,15 +1072,18 @@ class DFlashWorker:
             "min_verify_tokens": int(self._confidence_gate_min_verify_tokens),
             "runtime_block_size": int(runtime_block_size),
             "verify_token_num": int(verify_token_num),
-            "per_req_verify_tokens": [int(v) for v in per_req_verify_tokens.tolist()],
-            "per_req_score_budget_used": [
-                float(v) for v in per_req_score_budget_used.tolist()
-            ],
             "mab_enabled": False,
             "mab_algo": str(self._confidence_gate_mab_algo),
             "mab_round": int(self._confidence_gate_mab_rounds),
             "mab_scores": None,
         }
+        if self._should_materialize_confidence_gate_trace():
+            decision["per_req_verify_tokens"] = [
+                int(v) for v in per_req_verify_tokens.tolist()
+            ]
+            decision["per_req_score_budget_used"] = [
+                float(v) for v in per_req_score_budget_used.tolist()
+            ]
         return int(verify_token_num), decision, per_req_verify_tokens
 
     def _build_grouped_verify_plan(
@@ -1368,16 +1439,26 @@ class DFlashWorker:
                 "selection_reason": "missing_decision",
             }
             return
+        if not (self._report_cycle_trace or self._confidence_gate_mab_enabled):
+            self._last_confidence_gate_decision = decision
+            return
 
         proposed = max(int(decision.get("verify_token_num", 1)) - 1, 0)
-        per_req_verify_tokens = decision.get("per_req_verify_tokens", None)
+        per_req_verify_tokens = getattr(self, "_last_per_req_verify_tokens", None)
         accepted_sum = float(sum(max(0, int(v)) for v in accept_length_per_req_cpu))
         # Cycle-level tau includes target bonus token.
         tau_sum = float(
             sum(max(0, int(v)) + 1 for v in accept_length_per_req_cpu)
         )
         proposed_total = 0
-        if isinstance(per_req_verify_tokens, list) and len(per_req_verify_tokens) > 0:
+        if isinstance(per_req_verify_tokens, torch.Tensor) and per_req_verify_tokens.numel() > 0:
+            proposed_total = int(
+                torch.clamp(
+                    per_req_verify_tokens.to(dtype=torch.int64) - 1,
+                    min=0,
+                ).sum().item()
+            )
+        elif isinstance(per_req_verify_tokens, list) and len(per_req_verify_tokens) > 0:
             proposed_total = int(
                 sum(max(0, int(v) - 1) for v in per_req_verify_tokens)
             )
@@ -2611,6 +2692,21 @@ class DFlashWorker:
             if cycle_e2e_s > 0.0 and len(batch.reqs) > 0
             else None
         )
+        per_req_predictor_time_s = (
+            float(self._last_predictor_time_s) / float(len(batch.reqs))
+            if self._report_timing and self._last_predictor_time_s > 0.0
+            else None
+        )
+        per_req_confidence_gate_time_s = (
+            float(self._last_confidence_gate_time_s) / float(len(batch.reqs))
+            if self._report_timing and self._last_confidence_gate_time_s > 0.0
+            else None
+        )
+        per_req_confidence_gate_state_time_s = (
+            float(self._last_confidence_gate_state_time_s) / float(len(batch.reqs))
+            if self._report_timing and self._last_confidence_gate_state_time_s > 0.0
+            else None
+        )
 
         for req, accepted_draft_tokens in self._iter_req_value_pairs(
             batch.reqs, accept_length_per_req_cpu, tag="cycle_trace"
@@ -2667,6 +2763,9 @@ class DFlashWorker:
                     "accept_rate": accept_rate,
                     "draft_time_s": per_req_draft_time_s,
                     "verify_time_s": per_req_verify_time_s,
+                    "predictor_time_s": per_req_predictor_time_s,
+                    "confidence_gate_time_s": per_req_confidence_gate_time_s,
+                    "confidence_gate_state_time_s": per_req_confidence_gate_state_time_s,
                     "verify_can_run_cuda_graph": bool(
                         getattr(self, "_last_can_run_cuda_graph", False)
                     ),
@@ -3342,6 +3441,19 @@ class DFlashWorker:
                 confidence_gate_decision["grouped_verify_buckets"] = [
                     int(v) for v in self._confidence_gate_grouped_verify_buckets
                 ]
+            if self._report_timing and self.tp_rank == 0:
+                if self._last_predictor_time_s > 0.0:
+                    self._accumulate_req_shared_time(
+                        batch.reqs,
+                        "spec_predictor_time_s",
+                        float(self._last_predictor_time_s),
+                    )
+                if self._last_confidence_gate_time_s > 0.0:
+                    self._accumulate_req_shared_time(
+                        batch.reqs,
+                        "spec_confidence_gate_time_s",
+                        float(self._last_confidence_gate_time_s),
+                    )
         self._last_verify_token_num = int(verify_token_num)
         if (
             self._confidence_gate_enabled
@@ -4471,13 +4583,28 @@ class DFlashWorker:
                     "runtime_block_size": int(runtime_bs),
                     "verify_token_num": int(verify_token_num),
                 }
-            self._update_confidence_gate_state(
-                decision=conf_decision,
-                accept_length_per_req_cpu=accept_length_per_req_cpu,
-                cycle_e2e_s=float(cycle_e2e_s),
+            _, gate_state_time_s = self._measure_wall_time_s(
+                lambda: self._update_confidence_gate_state(
+                    decision=conf_decision,
+                    accept_length_per_req_cpu=accept_length_per_req_cpu,
+                    cycle_e2e_s=float(cycle_e2e_s),
+                ),
+                sync_cuda=False,
             )
-            for req in batch.reqs:
-                req.dflash_confidence_gate_last_decision = self._last_confidence_gate_decision
+            self._last_confidence_gate_state_time_s = float(gate_state_time_s)
+            if self._report_timing and self.tp_rank == 0 and gate_state_time_s > 0.0:
+                self._accumulate_req_shared_time(
+                    batch.reqs,
+                    "spec_confidence_gate_state_time_s",
+                    float(gate_state_time_s),
+                )
+            if self._report_cycle_trace:
+                for req in batch.reqs:
+                    req.dflash_confidence_gate_last_decision = (
+                        self._last_confidence_gate_decision
+                    )
+        else:
+            self._last_confidence_gate_state_time_s = 0.0
         multi_candidate_info = getattr(self, "_last_multi_candidate_info", None)
         multi_candidate_summary = None
         if isinstance(multi_candidate_info, dict) and multi_candidate_info.get("enabled", False):

@@ -32,6 +32,8 @@ class LoadedDFlashPredictor:
     input_dim: int
     hidden_dim: int
     dropout: float
+    output_mode: str
+    model_dtype: torch.dtype
 
 
 def _get_nested(mapping: dict[str, Any], *keys: str) -> Any:
@@ -72,6 +74,15 @@ def load_dflash_accept_predictor(
         _get_nested(metrics, "args", "hidden_dim") or int(first_weight.shape[0])
     )
     dropout = float(_get_nested(metrics, "args", "dropout") or 0.0)
+    output_mode = str(
+        payload.get("output_mode")
+        or metrics.get("output_mode")
+        or (
+            "hazard"
+            if str(_get_nested(metrics, "args", "objective") or "") == "hazard"
+            else "prefix_survival"
+        )
+    )
 
     model = AcceptPredictorMLP(
         input_dim=input_dim,
@@ -81,10 +92,13 @@ def load_dflash_accept_predictor(
     model.load_state_dict(model_state_dict)
     model = model.to(device)
     model.eval()
+    model_dtype = next(model.parameters()).dtype
     return LoadedDFlashPredictor(
         model=model,
         checkpoint_path=str(checkpoint_path),
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         dropout=dropout,
+        output_mode=output_mode,
+        model_dtype=model_dtype,
     )

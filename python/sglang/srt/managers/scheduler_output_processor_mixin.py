@@ -912,6 +912,9 @@ class SchedulerOutputProcessorMixin:
         spec_acceptance_histogram = []
         spec_draft_time_s = []
         spec_verify_time_s = []
+        spec_predictor_time_s = []
+        spec_confidence_gate_time_s = []
+        spec_confidence_gate_state_time_s = []
         spec_runtime_bs_hist = []
         spec_cycle_trace = []
         retraction_counts = []
@@ -1035,6 +1038,13 @@ class SchedulerOutputProcessorMixin:
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
                     spec_draft_time_s.append(float(req.spec_draft_time_s))
                     spec_verify_time_s.append(float(req.spec_verify_time_s))
+                    spec_predictor_time_s.append(float(req.spec_predictor_time_s))
+                    spec_confidence_gate_time_s.append(
+                        float(req.spec_confidence_gate_time_s)
+                    )
+                    spec_confidence_gate_state_time_s.append(
+                        float(req.spec_confidence_gate_state_time_s)
+                    )
                     spec_runtime_bs_hist.append(
                         dict(getattr(req, "dflash_runtime_bs_hist", {}) or {})
                     )
@@ -1150,6 +1160,9 @@ class SchedulerOutputProcessorMixin:
                     spec_acceptance_histogram=spec_acceptance_histogram,
                     spec_draft_time_s=spec_draft_time_s,
                     spec_verify_time_s=spec_verify_time_s,
+                    spec_predictor_time_s=spec_predictor_time_s,
+                    spec_confidence_gate_time_s=spec_confidence_gate_time_s,
+                    spec_confidence_gate_state_time_s=spec_confidence_gate_state_time_s,
                     spec_runtime_bs_hist=spec_runtime_bs_hist,
                     spec_cycle_trace=spec_cycle_trace,
                     time_stats=time_stats,
