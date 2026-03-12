@@ -1879,6 +1879,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         )
 
             if (
+                hasattr(recv_obj, "spec_verify_prep_time_s")
+                and recv_obj.spec_verify_prep_time_s is not None
+                and len(recv_obj.spec_verify_prep_time_s) > i
+            ):
+                verify_prep_time_s = recv_obj.spec_verify_prep_time_s[i]
+                if verify_prep_time_s is not None:
+                    meta_info["spec_verify_prep_time_s"] = float(verify_prep_time_s)
+                    if recv_obj.spec_verify_ct[i] > 0:
+                        meta_info["spec_verify_prep_time_per_cycle_s"] = float(
+                            verify_prep_time_s / recv_obj.spec_verify_ct[i]
+                        )
+
+            if (
                 hasattr(recv_obj, "spec_predictor_time_s")
                 and recv_obj.spec_predictor_time_s is not None
                 and len(recv_obj.spec_predictor_time_s) > i
@@ -1917,6 +1930,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     if recv_obj.spec_verify_ct[i] > 0:
                         meta_info["spec_confidence_gate_state_time_per_cycle_s"] = (
                             float(gate_state_time_s / recv_obj.spec_verify_ct[i])
+                        )
+
+            if (
+                hasattr(recv_obj, "spec_post_verify_bookkeeping_time_s")
+                and recv_obj.spec_post_verify_bookkeeping_time_s is not None
+                and len(recv_obj.spec_post_verify_bookkeeping_time_s) > i
+            ):
+                post_verify_bookkeeping_time_s = (
+                    recv_obj.spec_post_verify_bookkeeping_time_s[i]
+                )
+                if post_verify_bookkeeping_time_s is not None:
+                    meta_info["spec_post_verify_bookkeeping_time_s"] = float(
+                        post_verify_bookkeeping_time_s
+                    )
+                    if recv_obj.spec_verify_ct[i] > 0:
+                        meta_info[
+                            "spec_post_verify_bookkeeping_time_per_cycle_s"
+                        ] = float(
+                            post_verify_bookkeeping_time_s
+                            / recv_obj.spec_verify_ct[i]
                         )
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.

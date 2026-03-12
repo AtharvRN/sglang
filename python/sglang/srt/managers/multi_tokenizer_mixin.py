@@ -136,6 +136,9 @@ def _handle_output_by_index(output, i):
             ),
             spec_draft_time_s=_extract_field_by_index(output, "spec_draft_time_s", i),
             spec_verify_time_s=_extract_field_by_index(output, "spec_verify_time_s", i),
+            spec_verify_prep_time_s=_extract_field_by_index(
+                output, "spec_verify_prep_time_s", i
+            ),
             spec_predictor_time_s=_extract_field_by_index(
                 output, "spec_predictor_time_s", i
             ),
@@ -144,6 +147,9 @@ def _handle_output_by_index(output, i):
             ),
             spec_confidence_gate_state_time_s=_extract_field_by_index(
                 output, "spec_confidence_gate_state_time_s", i
+            ),
+            spec_post_verify_bookkeeping_time_s=_extract_field_by_index(
+                output, "spec_post_verify_bookkeeping_time_s", i
             ),
             spec_runtime_bs_hist=_extract_field_by_index(
                 output, "spec_runtime_bs_hist", i
@@ -243,6 +249,9 @@ def _handle_output_by_index(output, i):
             ),
             spec_draft_time_s=_extract_field_by_index(output, "spec_draft_time_s", i),
             spec_verify_time_s=_extract_field_by_index(output, "spec_verify_time_s", i),
+            spec_verify_prep_time_s=_extract_field_by_index(
+                output, "spec_verify_prep_time_s", i
+            ),
             spec_predictor_time_s=_extract_field_by_index(
                 output, "spec_predictor_time_s", i
             ),
@@ -251,6 +260,9 @@ def _handle_output_by_index(output, i):
             ),
             spec_confidence_gate_state_time_s=_extract_field_by_index(
                 output, "spec_confidence_gate_state_time_s", i
+            ),
+            spec_post_verify_bookkeeping_time_s=_extract_field_by_index(
+                output, "spec_post_verify_bookkeeping_time_s", i
             ),
             spec_runtime_bs_hist=_extract_field_by_index(
                 output, "spec_runtime_bs_hist", i

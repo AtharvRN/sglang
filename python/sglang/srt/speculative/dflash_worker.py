@@ -387,6 +387,8 @@ class DFlashWorker:
         self._last_predictor_time_s = 0.0
         self._last_confidence_gate_time_s = 0.0
         self._last_confidence_gate_state_time_s = 0.0
+        self._last_verify_prep_time_s = 0.0
+        self._last_post_verify_bookkeeping_time_s = 0.0
         self._last_draft_tokens_2d: Optional[torch.Tensor] = None
         self._last_verify_positions_2d: Optional[torch.Tensor] = None
         self._last_grouped_verify_active = False
@@ -2692,6 +2694,11 @@ class DFlashWorker:
             if self._report_timing and verify_time_s > 0.0
             else None
         )
+        per_req_verify_prep_time_s = (
+            float(self._last_verify_prep_time_s) / float(len(batch.reqs))
+            if self._report_timing and self._last_verify_prep_time_s > 0.0
+            else None
+        )
         per_req_cycle_e2e_s = (
             float(cycle_e2e_s) / float(len(batch.reqs))
             if cycle_e2e_s > 0.0 and len(batch.reqs) > 0
@@ -2710,6 +2717,12 @@ class DFlashWorker:
         per_req_confidence_gate_state_time_s = (
             float(self._last_confidence_gate_state_time_s) / float(len(batch.reqs))
             if self._report_timing and self._last_confidence_gate_state_time_s > 0.0
+            else None
+        )
+        per_req_post_verify_bookkeeping_time_s = (
+            float(self._last_post_verify_bookkeeping_time_s) / float(len(batch.reqs))
+            if self._report_timing
+            and self._last_post_verify_bookkeeping_time_s > 0.0
             else None
         )
 
@@ -2768,9 +2781,13 @@ class DFlashWorker:
                     "accept_rate": accept_rate,
                     "draft_time_s": per_req_draft_time_s,
                     "verify_time_s": per_req_verify_time_s,
+                    "verify_prep_time_s": per_req_verify_prep_time_s,
                     "predictor_time_s": per_req_predictor_time_s,
                     "confidence_gate_time_s": per_req_confidence_gate_time_s,
                     "confidence_gate_state_time_s": per_req_confidence_gate_state_time_s,
+                    "post_verify_bookkeeping_time_s": (
+                        per_req_post_verify_bookkeeping_time_s
+                    ),
                     "verify_can_run_cuda_graph": bool(
                         getattr(self, "_last_can_run_cuda_graph", False)
                     ),
@@ -3081,6 +3098,7 @@ class DFlashWorker:
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
     ):
+        self._last_verify_prep_time_s = 0.0
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
@@ -3316,6 +3334,7 @@ class DFlashWorker:
                 )
                 verify_input = None
                 if verify_mode == "packed_tree":
+                    verify_prep_start_t = time.perf_counter()
                     if compact_tree:
                         suffix_len = int(runtime_block_size - shared_prefix_len)
                         shared_tokens_2d = candidate_tokens_3d[:, 0, :shared_prefix_len]
@@ -3366,6 +3385,9 @@ class DFlashWorker:
                         batch,
                         self.page_size,
                         build_custom_mask=build_custom_mask,
+                    )
+                    self._last_verify_prep_time_s = max(
+                        time.perf_counter() - verify_prep_start_t, 0.0
                     )
                     effective_verify_tokens_per_req = int(verify_tokens_2d.shape[1])
                 else:
@@ -3422,6 +3444,16 @@ class DFlashWorker:
                 )
                 batch.spec_info = verify_input
                 batch.return_hidden_states = False
+                if (
+                    self._report_timing
+                    and self.tp_rank == 0
+                    and self._last_verify_prep_time_s > 0.0
+                ):
+                    self._accumulate_req_shared_time(
+                        batch.reqs,
+                        "spec_verify_prep_time_s",
+                        float(self._last_verify_prep_time_s),
+                    )
                 return
 
         verify_token_num = int(runtime_block_size)
@@ -3512,6 +3544,7 @@ class DFlashWorker:
                 batch.return_hidden_states = False
                 return
 
+        verify_prep_start_t = time.perf_counter()
         verify_tokens_2d = draft_tokens[:, :verify_token_num]
         verify_positions_2d = positions_2d[:, :verify_token_num]
         positions = verify_positions_2d.reshape(-1).contiguous()
@@ -3530,6 +3563,9 @@ class DFlashWorker:
             self.page_size,
             build_custom_mask=build_custom_mask,
         )
+        self._last_verify_prep_time_s = max(
+            time.perf_counter() - verify_prep_start_t, 0.0
+        )
 
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -3538,6 +3574,16 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+        if (
+            self._report_timing
+            and self.tp_rank == 0
+            and self._last_verify_prep_time_s > 0.0
+        ):
+            self._accumulate_req_shared_time(
+                batch.reqs,
+                "spec_verify_prep_time_s",
+                float(self._last_verify_prep_time_s),
+            )
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -4401,6 +4447,7 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
         verify_time_s = 0.0
+        self._last_post_verify_bookkeeping_time_s = 0.0
         can_run_cuda_graph = True
         logits_output = None
         grouped_verify_consumed = False
@@ -4610,6 +4657,7 @@ class DFlashWorker:
                     )
         else:
             self._last_confidence_gate_state_time_s = 0.0
+        post_verify_bookkeeping_start_t = time.perf_counter()
         multi_candidate_info = getattr(self, "_last_multi_candidate_info", None)
         multi_candidate_summary = None
         if isinstance(multi_candidate_info, dict) and multi_candidate_info.get("enabled", False):
@@ -4705,6 +4753,19 @@ class DFlashWorker:
                 accept_length_per_req_cpu,
             )
             self._logged_first_verify = True
+        self._last_post_verify_bookkeeping_time_s = max(
+            time.perf_counter() - post_verify_bookkeeping_start_t, 0.0
+        )
+        if (
+            self._report_timing
+            and self.tp_rank == 0
+            and self._last_post_verify_bookkeeping_time_s > 0.0
+        ):
+            self._accumulate_req_shared_time(
+                batch.reqs,
+                "spec_post_verify_bookkeeping_time_s",
+                float(self._last_post_verify_bookkeeping_time_s),
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output,

@@ -99,9 +99,11 @@ class SpeculativeDecodingMetricsMixin:
     # Attributed speculative timing totals (seconds), if exposed by the server.
     spec_draft_time_s: List[float]
     spec_verify_time_s: List[float]
+    spec_verify_prep_time_s: List[float]
     spec_predictor_time_s: List[float]
     spec_confidence_gate_time_s: List[float]
     spec_confidence_gate_state_time_s: List[float]
+    spec_post_verify_bookkeeping_time_s: List[float]
 
     # Runtime DFLASH block-size histogram per request:
     # spec_runtime_bs_hist[i] = {block_size: verify_cycle_count}.
