@@ -523,6 +523,7 @@ class ServerArgs:
     speculative_dflash_confidence_gate_mab_algo: Literal["ucb", "thompson"] = "ucb"
     speculative_dflash_confidence_gate_mab_ucb_c: float = 1.0
     speculative_dflash_confidence_gate_mab_arms: Optional[List[float]] = None
+    speculative_dflash_confidence_gate_trace_detail: bool = False
     speculative_dflash_confidence_gate_grouped_verify: bool = False
     speculative_dflash_confidence_gate_grouped_verify_buckets: Optional[List[int]] = None
     speculative_dflash_multi_candidate: bool = False
@@ -5032,6 +5033,15 @@ class ServerArgs:
             help=(
                 "Optional confidence threshold arms for MAB (e.g., 0.15 0.20 0.25). "
                 "If unset, defaults are generated around --speculative-dflash-confidence-threshold."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dflash-confidence-gate-trace-detail",
+            action="store_true",
+            default=ServerArgs.speculative_dflash_confidence_gate_trace_detail,
+            help=(
+                "Include detailed per-request confidence-gate arrays in DFLASH cycle trace. "
+                "Off by default because it significantly increases trace payload size."
             ),
         )
         parser.add_argument(

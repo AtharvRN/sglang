@@ -4,7 +4,7 @@ import random
 import time
 import copy
 from copy import deepcopy
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -328,6 +328,13 @@ class DFlashWorker:
         }
         self._confidence_gate_mab_rounds = 0
         self._confidence_gate_mab_reward_norm_max = 1.0
+        self._confidence_gate_trace_detail = bool(
+            getattr(
+                server_args,
+                "speculative_dflash_confidence_gate_trace_detail",
+                False,
+            )
+        )
         self._confidence_gate_grouped_verify_enabled = bool(
             getattr(
                 server_args,
@@ -723,6 +730,52 @@ class DFlashWorker:
     def _should_materialize_confidence_gate_trace(self) -> bool:
         return bool(self._report_cycle_trace)
 
+    def _should_materialize_confidence_gate_trace_detail(self) -> bool:
+        return bool(self._report_cycle_trace and self._confidence_gate_trace_detail)
+
+    def _compact_confidence_gate_decision(
+        self, decision: Optional[dict[str, Any]]
+    ) -> Optional[dict[str, Any]]:
+        if not isinstance(decision, dict):
+            return None
+        compact: dict[str, Any] = {}
+        for key in (
+            "enabled",
+            "mode",
+            "threshold",
+            "selection_reason",
+            "aggregate",
+            "min_verify_tokens",
+            "runtime_block_size",
+            "verify_token_num",
+            "score_metric",
+            "score_budget",
+            "mab_enabled",
+            "mab_algo",
+            "mab_round",
+            "mab_selected_count",
+            "mab_selected_mean_reward",
+            "mab_reward_norm",
+            "mab_reward_norm_max",
+            "mab_selected_alpha",
+            "mab_selected_beta",
+            "reward",
+            "reward_source",
+            "accepted_draft_tokens_sum",
+            "tau_sum",
+            "proposed_draft_tokens_sum",
+            "accept_ratio",
+            "cycle_e2e_s",
+            "grouped_verify_enabled",
+            "grouped_verify_candidate",
+            "grouped_verify_applied",
+            "grouped_verify_buckets",
+            "grouped_verify_plan",
+        ):
+            if key in decision:
+                compact[key] = decision[key]
+        return compact
+
     def _compute_confidence_gated_verify_tokens(
         self,
         *,
@@ -902,7 +955,7 @@ class DFlashWorker:
             "predictor_hidden_dim": int(self._accept_predictor.hidden_dim),
             "predictor_output_mode": str(self._accept_predictor.output_mode),
         }
-        if self._should_materialize_confidence_gate_trace():
+        if self._should_materialize_confidence_gate_trace_detail():
             decision["per_req_verify_tokens"] = [
                 int(v) for v in per_req_verify_tokens.tolist()
             ]
@@ -983,7 +1036,7 @@ class DFlashWorker:
                 else None
             ),
         }
-        if self._should_materialize_confidence_gate_trace():
+        if self._should_materialize_confidence_gate_trace_detail():
             decision["per_req_verify_tokens"] = [
                 int(v) for v in per_req_verify_tokens.tolist()
             ]
@@ -1083,7 +1136,7 @@ class DFlashWorker:
             "mab_round": int(self._confidence_gate_mab_rounds),
             "mab_scores": None,
         }
-        if self._should_materialize_confidence_gate_trace():
+        if self._should_materialize_confidence_gate_trace_detail():
             decision["per_req_verify_tokens"] = [
                 int(v) for v in per_req_verify_tokens.tolist()
             ]
@@ -4653,6 +4706,10 @@ class DFlashWorker:
                 for req in batch.reqs:
                     req.dflash_confidence_gate_last_decision = (
                         self._last_confidence_gate_decision
+                        if self._should_materialize_confidence_gate_trace_detail()
+                        else self._compact_confidence_gate_decision(
+                            self._last_confidence_gate_decision
+                        )
                     )
         else:
             self._last_confidence_gate_state_time_s = 0.0
