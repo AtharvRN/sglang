@@ -315,6 +315,14 @@ class SchedulerOutputProcessorMixin:
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
+        cycle_done_ts = None
+        for req in batch.reqs:
+            if req.finished() or req.is_retracted:
+                continue
+            if cycle_done_ts is None:
+                cycle_done_ts = time.perf_counter()
+            req.time_stats.mark_decode_cycle_postprocess_done(cycle_done_ts)
+
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
