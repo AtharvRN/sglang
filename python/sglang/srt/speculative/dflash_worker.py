@@ -784,7 +784,12 @@ class DFlashWorker:
     ):
         start_t = time.perf_counter()
         out = fn()
-        if sync_cuda and torch.cuda.is_available() and self.device.type == "cuda":
+        device_type = (
+            self.device.type
+            if isinstance(self.device, torch.device)
+            else str(self.device)
+        )
+        if sync_cuda and torch.cuda.is_available() and device_type == "cuda":
             torch.cuda.synchronize(self.device)
         return out, max(time.perf_counter() - start_t, 0.0)
 
